@@ -78,6 +78,18 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "F32"))  return 2;
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
+    /* DeepSeek-V4-Flash etiqueta los bytes cuantizados con su dtype real en vez
+     * de U8: los expertos MXFP4 van como I8 (ya cubierto arriba) y las escalas
+     * como F8_E8M0; el denso va como F8_E4M3. Son bytes crudos igual: los
+     * consumen matmul_mxfp4 (fmt=7) y la ruta fmt=8 sin conversión. */
+    if (!strcmp(s, "F8_E4M3"))  return 3;
+    if (!strcmp(s, "F8_E8M0"))  return 3;
+    if (!strcmp(s, "F8_E5M2"))  return 3;
+    /* `tid2eid`, la tabla del routing hash: [vocab, topk] enteros. El
+     * `model.py` de DeepSeek la declara int32 pero el checkpoint la guarda en
+     * I64. Necesita su propio tamaño de elemento. */
+    if (!strcmp(s, "I64"))  return 4;
+    if (!strcmp(s, "I32"))  return 5;
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
 
@@ -506,7 +518,8 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * into a caller-sized buffer, so a header with numel != nbytes/esz is an
              * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
              * their numel is unused by the read path and legitimately may differ. */
-            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : 2);
+            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1
+                        : (t->dtype==4 ? 8 : (t->dtype==5 ? 4 : 2)));
               if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
                   fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
                           files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }

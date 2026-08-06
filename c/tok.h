@@ -52,6 +52,7 @@ typedef struct {
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
     int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
+    int dsv4;            /* 1 = DeepSeek-V4: Sequence de Splits Isolated */
     int kimi;            /* 1 = Kimi (K3) family: o200k rules + a leading \p{Han}-run rule,
                           * Han excluded from the letter classes, no '/' tail in the punct rule */
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
@@ -154,6 +155,29 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     if(merges) for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
+        /* Dos formatos en circulación. `tokenizers` moderno escribe cada merge
+         * como un array ["izq","der"]; el formato antiguo lo escribe como UNA
+         * cadena "izq der" separada por espacio. DeepSeek-V4-Flash usa el
+         * antiguo, y aceptar sólo el nuevo hace fallar la carga entera con
+         * "malformed merge entry 0".
+         *
+         * Partir por el primer espacio LITERAL es correcto aquí: en byte-level
+         * BPE los espacios del texto van codificados como U+0120 (Ġ), nunca
+         * como 0x20, así que el único 0x20 de la línea es el separador. */
+        jval lk, rk, *pk[2], arr;
+        if(pr && pr->t==J_STR && pr->str){
+            char *sp=strchr(pr->str, ' ');
+            if(!sp){ fprintf(stderr,"tokenizer.json: merge %d sin separador\n",i); exit(1); }
+            /* se parte in situ: el arena del JSON vive lo que dure la carga */
+            *sp = 0;
+            memset(&lk,0,sizeof lk); memset(&rk,0,sizeof rk);
+            lk.t=J_STR; lk.str=pr->str;
+            rk.t=J_STR; rk.str=sp+1;
+            pk[0]=&lk; pk[1]=&rk;
+            memset(&arr,0,sizeof arr);
+            arr.t=J_ARR; arr.len=2; arr.kids=pk;
+            pr=&arr;
+        }
         if(!pr||pr->t!=J_ARR||pr->len<2||!pr->kids[0]||!pr->kids[1]||
            pr->kids[0]->t!=J_STR||pr->kids[1]->t!=J_STR){
             fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
@@ -188,6 +212,9 @@ static void tok_load(Tok *T, const char *path){
             jval *rx=pat?json_get(pat,"Regex"):NULL;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Han}")) T->kimi=1;
+            /* DeepSeek-V4: una etapa del Sequence que aísla SÓLO dígitos.
+             * Es la firma del pre-tokenizer multi-etapa. */
+            if(rx&&rx->t==J_STR&&!strcmp(rx->str,"\\p{N}{1,3}")) T->dsv4=1;
         }
     }
     /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
@@ -452,6 +479,60 @@ static int km_letters(const uint32_t *cp, int n, int i){
     return -1;
 }
 
+/* ---------- pre-tokenizer DeepSeek-V4-Flash ----------
+ * A diferencia de cl100k/o200k/kimi, que resuelven todo en UNA alternación,
+ * DeepSeek encadena un Sequence de tres Split con behavior=Isolated:
+ *
+ *   0) \p{N}{1,3}
+ *   1) [一-龥぀-ゟ゠-ヿ]+      (han + kana)
+ *   2) la alternación grande (parecida a cl100k)
+ *
+ * El orden IMPORTA y no es equivalente a meterlo todo en una alternación: al
+ * aislar los dígitos ANTES, la racha de espacios que los precede se queda sin
+ * nada detrás dentro de su trozo y se agrupa ENTERA. cl100k, que ve el dígito
+ * en el mismo paso, parte esa racha por `\s+(?!\S)`.
+ *
+ * Ejemplo mínimo que lo destapa:  "\  0"
+ *   DeepSeek -> "\", "  ", "0"     (el doble espacio, un token)
+ *   cl100k   -> "\", " ", " ", "0" (dos tokens de un espacio)
+ *
+ * Aquí se implementan las etapas 0 y 1 como un pre-paso y los huecos se pasan a
+ * `pretok_chunk`, cuya alternación coincide con la etapa 2 en todo lo medido.
+ */
+static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max);
+
+static inline int dsv4_cjk(uint32_t c){
+    return (c>=0x4E00&&c<=0x9FA5)||(c>=0x3040&&c<=0x309F)||(c>=0x30A0&&c<=0x30FF);
+}
+
+static void pretok_chunk_dsv4(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+
+    int i=0, gap=0;                     /* `gap` = inicio del hueco pendiente */
+    while(i<n){
+        if(is_N(cp[i]) || dsv4_cjk(cp[i])){
+            if(i>gap) pretok_chunk(T,p,off[gap],off[i],out,no,max);   /* etapa 2 */
+            if(is_N(cp[i])){
+                /* dígitos en grupos de hasta 3, cada grupo su propia pieza */
+                while(i<n && is_N(cp[i])){
+                    int s=i,k=0; while(i<n && is_N(cp[i]) && k<3){ i++; k++; }
+                    bpe_piece(T,p,off[s],off[i],out,no,max);
+                }
+            } else {
+                int s=i; while(i<n && dsv4_cjk(cp[i])) i++;
+                bpe_piece(T,p,off[s],off[i],out,no,max);
+            }
+            gap=i;
+        } else i++;
+    }
+    if(n>gap) pretok_chunk(T,p,off[gap],off[n],out,no,max);
+
+    free(cp); free(off);
+}
+
 static void pretok_chunk_kimi(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
     int nb=b-a; if(nb<=0) return;
     uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
@@ -511,7 +592,8 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->kimi)       pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
+            if(T->dsv4)       pretok_chunk_dsv4(T,p,i,chunk_end,out,&no,max);
+            else if(T->kimi)  pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
             else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
             else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }
