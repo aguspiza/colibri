@@ -22,6 +22,9 @@
 
 #include <math.h>
 #include <stdint.h>
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
 
 /* Tabla de decodificación e4m3-fn, construida una vez.
  *
@@ -31,10 +34,15 @@
  * del formato.
  */
 static float g_dsv4_e4m3[256];
+/* Escalas UE8M0: el byte ES el exponente, así que las 256 caben en una tabla y
+ * el `ldexpf` sale del bucle caliente. Era una llamada a libm por cada bloque de
+ * 128 y por cada fila de salida — 8 millones por token. */
+static float g_dsv4_ue8m0[256];
 static int g_dsv4_e4m3_ready = 0;
 
 static inline void dsv4_e4m3_init(void) {
     if (g_dsv4_e4m3_ready) return;
+    for (int b = 0; b < 256; b++) g_dsv4_ue8m0[b] = ldexpf(1.0f, b - 127);
     for (int b = 0; b < 256; b++) {
         const int sign = (b & 0x80) ? -1 : 1;
         const int exp = (b >> 3) & 0x0F;
@@ -77,6 +85,12 @@ static inline void dsv4_matmul_fp8_ue8m0(float *y, const float *x,
     for (int s = 0; s < S; s++) {
         const float *xr = x + (size_t)s * I;
         float *yr = y + (size_t)s * O;
+        /* Las filas de salida son independientes: no hay reducción entre ellas,
+         * así que el reparto es trivialmente correcto. En decode S==1 y todo el
+         * paralelismo disponible está aquí. */
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static) if (O >= 256)
+#endif
         for (int o = 0; o < O; o++) {
             const uint8_t *row = q8 + (size_t)o * I;
             const uint8_t *sc = e8s + (size_t)(o / DSV4_FP8_BLOCK) * nbi;
@@ -88,9 +102,30 @@ static inline void dsv4_matmul_fp8_ue8m0(float *y, const float *x,
                 const int i0 = b * DSV4_FP8_BLOCK;
                 const int i1 = (i0 + DSV4_FP8_BLOCK < I) ? i0 + DSV4_FP8_BLOCK : I;
                 float part = 0.0f;
-                for (int i = i0; i < i1; i++)
+                int i = i0;
+#if defined(__AVX2__) && defined(__FMA__)
+                /* Los bytes e4m3 se decodifican por `gather` sobre la LUT de 256
+                 * floats: cabe entera en L1, que es la razón de que el gather
+                 * salga a cuenta aquí y no en general. */
+                __m256 va = _mm256_setzero_ps();
+                for (; i + 8 <= i1; i += 8) {
+                    const __m256i idx =
+                        _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(row + i)));
+                    const __m256 wv = _mm256_i32gather_ps(g_dsv4_e4m3, idx, 4);
+                    va = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i), wv, va);
+                }
+                {   /* suma horizontal */
+                    __m128 lo = _mm256_castps256_ps128(va);
+                    __m128 hi = _mm256_extractf128_ps(va, 1);
+                    lo = _mm_add_ps(lo, hi);
+                    lo = _mm_hadd_ps(lo, lo);
+                    lo = _mm_hadd_ps(lo, lo);
+                    part = _mm_cvtss_f32(lo);
+                }
+#endif
+                for (; i < i1; i++)
                     part += xr[i] * g_dsv4_e4m3[row[i]];
-                acc += part * ldexpf(1.0f, (int)sc[b] - 127);
+                acc += part * g_dsv4_ue8m0[sc[b]];
             }
             yr[o] = acc;
         }

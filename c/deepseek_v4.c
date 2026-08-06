@@ -26,6 +26,10 @@
 #include <math.h>
 #include <time.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "compat.h"
 #include "json.h"
 #include "st.h"
@@ -48,6 +52,15 @@ static double now_s(void) {
     return t.tv_sec + t.tv_nsec * 1e-9;
 #endif
 }
+
+/* Perfil: dónde se va el tiempo. Antes de optimizar, medir. */
+static double g_t_attn, g_t_moe, g_t_io, g_t_head;
+static uint64_t g_pf_bytes, g_pf_batches, g_pf_reads, g_fb_bytes;
+static int g_pf_threads;
+static uint8_t g_seen[(43 * 256 + 7) / 8];   /* capas x expertos, 1 bit cada uno */
+static uint64_t g_distinct;
+static FILE *g_trace;   /* DSV4_TRACE=fichero -> vuelca (token,capa,experto) */
+static int g_tok_no;
 
 /* ---------------------------------------------------------------------------
  * Tier de expertos por streaming.
@@ -93,31 +106,113 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
         }
 }
 
-/* Devuelve los descriptores del experto, leyéndolo si no está en caché. */
+/* Busca el experto en la caché; -1 si no está. */
+static int tier_find(const ExpertTier *T, int layer, int e)
+{
+    for (int i = 0; i < T->nslot; i++)
+        if (T->slots[i].layer == layer && T->slots[i].expert == e) return i;
+    return -1;
+}
+
+/* Reserva un slot por LRU y lo marca como recién usado, de forma que una
+ * reserva posterior DENTRO DE LA MISMA TANDA no pueda expulsarlo. */
+static int tier_reserve(ExpertTier *T)
+{
+    int v;
+    if (T->nslot < T->cap) v = T->nslot++;
+    else {
+        v = 0;
+        for (int i = 1; i < T->nslot; i++)
+            if (T->slots[i].used < T->slots[v].used) v = i;
+    }
+    T->slots[v].used = ++T->clock;
+    return v;
+}
+
+/* Lee los 6 tensores de un experto en su slot. Sin estado compartido salvo el
+ * contador de bytes, así que es seguro llamarla desde varios hilos sobre slots
+ * distintos: `compat_pread` es ReadFile+OVERLAPPED sobre el handle crudo,
+ * precisamente para no depender del puntero de fichero. */
+static void tier_fill(ExpertTier *T, int slot, int layer, int e)
+{
+    ExpSlot *s = &T->slots[slot];
+    char (*row)[96] = T->names[(size_t)layer * T->n_experts + e];
+    uint64_t nread = 0;
+    for (int k = 0; k < 6; k++) {
+        const int64_t nb = st_nbytes(T->S, row[k]);
+        s->buf[k] = realloc(s->buf[k], (size_t)nb);
+        st_read_raw(T->S, row[k], s->buf[k], 0);
+        nread += (uint64_t)nb;
+    }
+    s->layer = layer; s->expert = e;
+#ifdef _OPENMP
+#   pragma omp atomic
+#endif
+    T->bytes += nread;
+}
+
+/* Trae de golpe los `n` expertos que el router acaba de elegir.
+ *
+ * Es la diferencia entre profundidad de cola 1 y n: un NVMe da su ancho de
+ * banda con varias lecturas en vuelo, y de una en una se queda en la latencia.
+ * La reserva de slots va en serie —el LRU es estado global— y sólo las lecturas
+ * se reparten. */
+static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
+{
+    int slot[16], want[16], nw = 0;
+    if (n > 16) n = 16;
+    if (g_trace) for (int k = 0; k < n; k++)
+        fprintf(g_trace, "%d %d %d\n", g_tok_no, layer, es[k]);
+    for (int k = 0; k < n; k++) {
+        int dup = 0;
+        for (int j = 0; j < nw; j++) if (want[j] == es[k]) { dup = 1; break; }
+        if (dup) continue;
+        const int f = tier_find(T, layer, es[k]);
+        if (f >= 0) { T->hits++; T->slots[f].used = ++T->clock; continue; }
+        T->miss++;
+        /* Cuántos expertos DISTINTOS pide la generación entera: es el número de
+         * fallos que tendría una caché infinita, o sea el techo de lo que puede
+         * dar agrandar ésta. Si ya estamos cerca, crecer no sirve de nada. */
+        {   const size_t bit = (size_t)layer * T->n_experts + es[k];
+            if (!(g_seen[bit >> 3] & (1u << (bit & 7)))) {
+                g_seen[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+                g_distinct++;
+            }
+        }
+        want[nw] = es[k];
+        slot[nw] = tier_reserve(T);
+        nw++;
+    }
+    if (!nw) return;
+
+    const double t0 = now_s();
+    g_pf_batches++; g_pf_reads += (uint64_t)nw;
+#ifdef _OPENMP
+#   pragma omp parallel for schedule(dynamic, 1) if (nw > 1)
+#endif
+    for (int j = 0; j < nw; j++) {
+#ifdef _OPENMP
+        if (j == 0) g_pf_threads = omp_get_num_threads();
+#endif
+        tier_fill(T, slot[j], layer, want[j]);
+    }
+    g_t_io += now_s() - t0;
+}
+
+/* Devuelve los descriptores del experto. Tras `tier_prefetch` siempre acierta;
+ * el camino de carga queda como red de seguridad para quien no lo use. */
 static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4W *w3)
 {
-    int hit = -1;
-    for (int i = 0; i < T->nslot; i++)
-        if (T->slots[i].layer == layer && T->slots[i].expert == e) { hit = i; break; }
-
+    int hit = tier_find(T, layer, e);
     if (hit < 0) {
         T->miss++;
-        if (T->nslot < T->cap) hit = T->nslot++;
-        else {
-            hit = 0;
-            for (int i = 1; i < T->nslot; i++)
-                if (T->slots[i].used < T->slots[hit].used) hit = i;
-        }
-        ExpSlot *s = &T->slots[hit];
-        char (*row)[96] = T->names[(size_t)layer * T->n_experts + e];
-        for (int k = 0; k < 6; k++) {
-            const int64_t nb = st_nbytes(T->S, row[k]);
-            s->buf[k] = realloc(s->buf[k], (size_t)nb);
-            st_read_raw(T->S, row[k], s->buf[k], 0);
-            T->bytes += (uint64_t)nb;
-        }
-        s->layer = layer; s->expert = e;
-    } else T->hits++;
+        hit = tier_reserve(T);
+        const double t0 = now_s();
+        const uint64_t b0 = T->bytes;
+        tier_fill(T, hit, layer, e);
+        g_fb_bytes += T->bytes - b0;
+        g_t_io += now_s() - t0;
+    }
 
     ExpSlot *s = &T->slots[hit];
     s->used = ++T->clock;
@@ -130,6 +225,9 @@ static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4
 static void tier_fetch(void *ctx, int layer, int e,
                        DsV4W *w1, DsV4W *w2, DsV4W *w3) {
     tier_get((ExpertTier *)ctx, layer, e, w1, w2, w3);
+}
+static void tier_prefetch_cb(void *ctx, int layer, const int *es, int n) {
+    tier_prefetch((ExpertTier *)ctx, layer, es, n);
 }
 
 /* ---------------------------------------------------------------------------
@@ -337,12 +435,17 @@ static void model_load(Model *M, const char *dir) {
     printf("\n");
 
     /* --- tier de expertos ------------------------------------------------ */
-    const int cache = 384;             /* ~5,1 GB de caché */
+    /* ~13,4 MB por experto. El tamaño manda sobre el I/O, que es el cuello de
+     * botella real, así que se deja ajustable para poder medirlo. */
+    { const char *tp = getenv("DSV4_TRACE"); if (tp) g_trace = fopen(tp, "w"); }
+    const char *cenv = getenv("DSV4_CACHE");
+    const int cache = cenv ? atoi(cenv) : 384;
     tier_init(&M->tier, &M->S, M->n_layers, n_exp, inter, M->dim, cache);
     /* Cada capa pide sus expertos al tier por callback: el MoE no sabe nada de
      * shards ni de política de caché. */
     for (int L = 0; L < M->n_layers; L++) {
         M->w[L].moe.fetch = tier_fetch;
+        M->w[L].moe.prefetch = tier_prefetch_cb;
         M->w[L].moe.fetch_ctx = &M->tier;
         M->w[L].moe.layer = L;
     }
@@ -375,7 +478,9 @@ static void model_layer_decode(Model *M, int L, DsV4AttnState *st,
                 coll, post, comb);
     dsv4_rmsnorm(tmp, coll, w->attn_norm, dim, c->norm_eps);
     for (int d = 0; d < dim; d++) coll[d] = dsv4_to_bf16(tmp[d]);
-    dsv4_attention_decode(&c->attn, &w->attn, st, coll, pos, sub);
+    { const double _t = now_s();
+      dsv4_attention_decode(&c->attn, &w->attn, st, coll, pos, sub);
+      g_t_attn += now_s() - _t; }
     dsv4_hc_expand(mid, sub, post, comb, hin, hc, dim);
 
     /* --- MoE --- */
@@ -385,7 +490,9 @@ static void model_layer_decode(Model *M, int L, DsV4AttnState *st,
     dsv4_rmsnorm(tmp, coll, w->ffn_norm, dim, c->norm_eps);
     for (int d = 0; d < dim; d++) coll[d] = dsv4_to_bf16(tmp[d]);
     /* el id del token sólo lo usan las capas hash, pero se pasa siempre */
-    dsv4_moe_forward(&c->moe, &w->moe, coll, &tokid, 1, sub);
+    { const double _t = now_s();
+      dsv4_moe_forward(&c->moe, &w->moe, coll, &tokid, 1, sub);
+      g_t_moe += now_s() - _t; }
     dsv4_hc_expand(hout, sub, post, comb, mid, hc, dim);
 
     free(coll); free(sub); free(mid); free(tmp);
@@ -433,6 +540,7 @@ int main(int argc, char **argv) {
          * que hacía antes— repite el último token del prompt y descarrila la
          * generación desde el primer paso. */
         const int tokid = ids[step];
+        g_tok_no = step;
 
         /* embedding -> hc copias */
         {
@@ -455,7 +563,9 @@ int main(int argc, char **argv) {
                          hc, dim, M.norm_eps, M.hc_eps, y);
             dsv4_rmsnorm(nz, y, M.final_norm, dim, M.norm_eps);
             for (int d = 0; d < dim; d++) nz[d] = dsv4_to_bf16(nz[d]);
-            dsv4_matmul_w(logits, nz, &M.head, 1, 0);
+            { const double _t = now_s();
+              dsv4_matmul_w(logits, nz, &M.head, 1, 0);
+              g_t_head += now_s() - _t; }
             int best = 0;
             for (int v = 1; v < M.vocab; v++) if (logits[v] > logits[best]) best = v;
             if (step < n + ngen - 1) ids[step + 1] = best;
@@ -467,8 +577,23 @@ int main(int argc, char **argv) {
     }
     const double dt = now_s() - tgen;
     printf("\n\n%d tokens en %.1f s (%.2f tok/s)\n", n + ngen, dt, (n + ngen) / dt);
-    printf("expertos: %llu hits / %llu miss, %.2f GB leidos\n",
+    printf("perfil (total): atencion %.1f s | MoE %.1f s | head %.1f s | resto %.1f s\n",
+           g_t_attn, g_t_moe, g_t_head, dt - g_t_attn - g_t_moe - g_t_head);
+    printf("  I/O: %llu tandas de prefetch, %.1f lecturas por tanda, %d hilos activos\n"
+           "       %.2f GB por prefetch, %.2f GB por el camino de respaldo\n",
+           (unsigned long long)g_pf_batches,
+           g_pf_batches ? (double)g_pf_reads / g_pf_batches : 0.0, g_pf_threads,
+           (double)(M.tier.bytes - g_fb_bytes) / 1e9, (double)g_fb_bytes / 1e9);
+    printf("  del MoE, %.1f s son I/O de expertos y %.1f s computo\n",
+           g_t_io, g_t_moe - g_t_io);
+    printf("expertos: %llu hits / %llu miss (%.0f%% acierto), %.2f GB leidos\n",
            (unsigned long long)M.tier.hits, (unsigned long long)M.tier.miss,
+           100.0 * M.tier.hits / (double)(M.tier.hits + M.tier.miss),
            (double)M.tier.bytes / 1e9);
+    printf("  cache de %d slots (%.1f GB); %llu expertos distintos en total\n"
+           "  -> una cache infinita tendria %llu fallos en vez de %llu\n",
+           M.tier.cap, M.tier.cap * 13.4e6 / 1e9,
+           (unsigned long long)g_distinct,
+           (unsigned long long)g_distinct, (unsigned long long)M.tier.miss);
     return 0;
 }

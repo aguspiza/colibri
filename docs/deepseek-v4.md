@@ -4,20 +4,72 @@
 de colibrì. El motor **corre y genera texto**:
 
 ```
-$ ./deepseek_v4 /modelos/DeepSeek-V4-Flash-0731 "La capital de Francia es" 6
+$ DSV4_CACHE=512 ./deepseek_v4 /modelos/DeepSeek-V4-Flash-0731 "La capital de Francia es" 8
 config: 43 capas, dim 4096, 64 cabezas x 512, 256 expertos top-6
-expertos: streaming con cache de 384 slots de 11008 totales
-cargado en 7.5 s
+expertos: streaming con cache de 512 slots de 11008 totales
 
-La capital de Francia es una de las ciudades más visitadas
+La capital de Francia es una de las ciudades más visitadas del mundo
 
-12 tokens en 76.8 s (0.16 tok/s)
-expertos: 1300 hits / 1796 miss, 24.01 GB leidos
+14 tokens en 33.5 s (0.42 tok/s)
+perfil (total): atencion 8.0 s | MoE 24.7 s | head 0.3 s | resto 0.5 s
+  del MoE, 19.5 s son I/O de expertos y 5.2 s computo
+expertos: 1765 hits / 1847 miss (49% acierto), 24.69 GB leidos
 ```
 
-En un Ryzen 5700U (Zen 2, **sin AVX-512**) con 17,4 GB de RAM libre y el
-checkpoint en un NVMe. 0,16 tok/s es lento, y se explica: ~2 GB de expertos
-leídos por token y la ruta SIMD de `quant.h` cayendo a AVX2.
+En un Ryzen 5700U (Zen 2, **sin AVX-512**) con 17,9 GB de RAM libre y el
+checkpoint en un NVMe.
+
+## Dónde se iba el tiempo
+
+La primera versión daba 0,16 tok/s. Medir antes de tocar nada dejó el reparto
+claro, y no era el que yo suponía:
+
+| | antes | ahora | qué pasaba |
+|---|---|---|---|
+| Atención | 35,5 s (55 %) | **5,8 s** | mi kernel FP8 era C escalar de un hilo |
+| `lm_head` | 1,9 s | **0,3 s** | ídem, en BF16 |
+| MoE cómputo | 11,1 s | **4,4 s** | el router BF16, también escalar |
+| MoE I/O | 15,9 s | 15,9 s | sin cambio: el disco manda |
+
+El MoE ya iba rápido porque usa `matmul_mxfp4` de colibrì, que sí trae AVX2. El
+resto lo había escrito yo priorizando que fuese legible y verificable contra la
+referencia, y se notaba: la atención hacía 4,6 GMAC/token en 3,5 s mientras el
+MoE hacía 6,5 GMAC en 1,1 s — **4,5× más lento por MAC**.
+
+Vectorizar (AVX2+FMA) y repartir las filas de salida entre los 8 núcleos da
+**2,6× en total**. Los errores contra la referencia no se mueven ni un dígito
+(FP8 4,82e-07, MoE 1,67e-03): el orden de acumulación cambia, la precisión no.
+
+## Ahora manda el disco
+
+Con el cómputo arreglado, el I/O es el 58 % del tiempo. Se leen 20 GB por cada
+14 tokens a **1,28 GB/s**, y ese número ya es el techo: el prefetch lanza las
+lecturas del `top-6` en paralelo sobre 16 hilos —`compat_pread` es
+`ReadFile`+`OVERLAPPED` sobre el handle crudo, así que es seguro— y no sube. Es
+un NVMe sin DRAM a su ritmo sostenido.
+
+Si no se puede leer más rápido, hay que leer menos. La caché LRU tiene poco
+recorrido: en esa generación se piden **1.529 expertos-capa distintos** frente a
+1.847 fallos, así que una caché infinita sólo ahorraría el 17 % restante.
+
+Lo que sí lo cambia es **procesar varios tokens a la vez**, porque comparten
+expertos. Medido sobre la traza de ruteo real del checkpoint:
+
+| lote | expertos-capa en la unión | lecturas/token | reducción |
+|---|---|---|---|
+| 1 | 258 | 258 | 1,00x |
+| 2 | 404 | 202 | 1,28x |
+| **5** | **724** | **145** | **1,78x** |
+| 8 | 995 | 124 | 2,07x |
+
+`dsv4_moe.h` ya lo aprovecha: recorre la **unión** de expertos del lote y aplica
+cada uno a todas las filas que lo eligieron, en vez de iterar fila a fila
+releyendo. En el test de streaming eso baja las lecturas de 132,51 MB a 22,02 MB
+con los logits **bit a bit idénticos**. Con `rows==1` el orden de acumulación es
+el de antes, así que el decode no cambia.
+
+Y 5 es justo `dspark_block_size` del `config.json`, que es lo que hace que la
+pila MTP sea la siguiente pieza y no un adorno — ver abajo.
 
 > **Sigue siendo trabajo en curso.** El forward está entero y validado pieza a
 > pieza contra la implementación de referencia de DeepSeek, pero falta la pila
@@ -141,8 +193,24 @@ con su struct `QT`.
   genera). Falta que el launcher lo reconozca por `model_type` y que hable el
   protocolo del gateway.
 - **MTP / DSpark**: 4.705 tensores (6,5 %). Son 3 bloques con `markov_head` y
-  `confidence_head` — la pila MTP *es* la implementación de DSpark. Es un
-  acelerador: el modelo genera sin ella.
+  `confidence_head` — la pila MTP *es* la implementación de DSpark. El modelo
+  genera sin ella, pero es **la vía con más recorrido para el rendimiento**, no
+  un adorno. El `config.json` la describe entera:
+
+  ```
+  dspark_block_size: 5          num_nextn_predict_layers: 1
+  dspark_target_layer_ids: [40, 41, 42]
+  dspark_markov_rank: 256       dspark_noise_token_id: 128799
+  ```
+
+  Verifica 5 tokens por pasada, y por la tabla de arriba eso es 1,78x menos I/O
+  por token — que es donde se va el 58 % del tiempo. **Cabe en memoria**: de sus
+  10,12 GiB en disco sólo **0,55 GiB son densos** (atención, `shared_experts`,
+  `gate`, las `hc_*` y las dos cabezas); los otros 9,56 GiB son expertos y van
+  por streaming como los demás. El residente pasaría de 8,67 a 9,22 GiB.
+  Estructuralmente cada bloque es un bloque normal —atención + MoE de 256
+  expertos + compartido— así que reutiliza las primitivas ya validadas; lo nuevo
+  son `markov_head`, `confidence_head` y el bucle de aceptación.
 - **Streaming real**: enganchar el pool de hilos, `experts_apply_union`, PILOT,
   `.coli_usage`, `O_DIRECT` y dual-SSD. Es infraestructura ya existente y
   agnóstica al modelo. Demostrado sobre un modelo reducido que la semántica no

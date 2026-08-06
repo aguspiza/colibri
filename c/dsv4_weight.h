@@ -127,14 +127,37 @@ static inline void dsv4_matmul_w(float *y, const float *x, const DsV4W *W,
     }
     case DSV4_W_BF16: {
         const uint16_t *p = (const uint16_t *)W->w;
-        for (int s = 0; s < S; s++)
+        for (int s = 0; s < S; s++) {
+            const float *xr = x + (size_t)s * I;
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static) if (O >= 256)
+#endif
             for (int o = 0; o < O; o++) {
                 const uint16_t *row = p + (size_t)o * I;
                 float acc = 0.0f;
-                for (int i = 0; i < I; i++)
-                    acc += x[(size_t)s * I + i] * dsv4_bf16_to_f32(row[i]);
+                int i = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                /* bf16 -> f32 es exacto y sin tablas: son los 16 bits altos del
+                 * f32, así que basta extender a 32 y desplazar. */
+                __m256 va = _mm256_setzero_ps();
+                for (; i + 8 <= I; i += 8) {
+                    const __m256i w32 = _mm256_slli_epi32(
+                        _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(row + i))), 16);
+                    va = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i),
+                                         _mm256_castsi256_ps(w32), va);
+                }
+                {
+                    __m128 lo = _mm256_castps256_ps128(va);
+                    lo = _mm_add_ps(lo, _mm256_extractf128_ps(va, 1));
+                    lo = _mm_hadd_ps(lo, lo);
+                    lo = _mm_hadd_ps(lo, lo);
+                    acc = _mm_cvtss_f32(lo);
+                }
+#endif
+                for (; i < I; i++) acc += xr[i] * dsv4_bf16_to_f32(row[i]);
                 y[(size_t)s * O + o] = bf16out ? dsv4_to_bf16(acc) : acc;
             }
+        }
         break;
     }
     case DSV4_W_FP8B:

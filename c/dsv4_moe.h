@@ -44,6 +44,13 @@ typedef struct {
      * `dsv4_moe.h` no tenga que conocer `st.h` ni la política de caché. */
     void (*fetch)(void *ctx, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4W *w3);
     void *fetch_ctx;
+
+    /* Prefetch opcional: el router ya sabe los `topk` expertos ANTES de aplicar
+     * ninguno, así que se pueden pedir todos de golpe y dejar que el backend
+     * solape las lecturas. Sin esto se leen de uno en uno con profundidad de
+     * cola 1, que es la peor forma de usar un NVMe. No cambia el resultado:
+     * sólo adelanta trabajo que `fetch` haría igual. */
+    void (*prefetch)(void *ctx, int layer, const int *es, int n);
 } DsV4MoeW;
 
 /* ---------------------------------------------------------------------------
@@ -160,29 +167,58 @@ static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
      * reemplazo: 11 de 64 tokens recibían el mismo experto dos veces y el
      * bloque salía con un error de 2,2e-1 mientras el ruteo era exacto. */
     memset(out, 0, (size_t)rows * c->dim * sizeof(float));
-    for (int64_t r = 0; r < rows; r++) {
-        for (int k = 0; k < c->topk; k++) {
-            const int e = idx[r * c->topk + k];
-            DsV4W w1, w2, w3;
-            if (w->fetch) {
-                w->fetch(w->fetch_ctx, w->layer, e, &w1, &w2, &w3);
-            } else if (w->store) {
-                /* Del disco, con caché LRU. El resto del cálculo es idéntico:
-                 * de dónde vinieron los bytes no puede cambiar el resultado. */
-                const int64_t per = (int64_t)c->inter * c->dim;
-                const float *blk = dsv4_store_get(w->store, w->layer, e);
-                w1 = dsv4_w_f32(blk,           c->inter, c->dim);
-                w2 = dsv4_w_f32(blk + per,     c->dim,   c->inter);
-                w3 = dsv4_w_f32(blk + 2 * per, c->inter, c->dim);
-            } else {
-                w1 = w->e_w1[e]; w2 = w->e_w2[e]; w3 = w->e_w3[e];
-            }
-            dsv4_expert_apply(c, &w1, &w2, &w3, x + r * c->dim,
-                              wt[r * c->topk + k], out + r * c->dim);
+
+    /* UNIÓN DE EXPERTOS.
+     *
+     * Con varias filas, el mismo experto suele salir elegido por varias: medido
+     * sobre el checkpoint real, un lote de 5 tokens pide 724 expertos-capa en
+     * vez de 5x258=1290, o sea 1,78x menos lecturas por token. Iterando fila a
+     * fila cada una lo pediría por su cuenta y se leerían 13,4 MB repetidos.
+     *
+     * Se recorre por EXPERTO y dentro por las filas que lo eligieron. El orden
+     * es el de primera aparición, no el de id: con rows==1 eso reproduce
+     * exactamente el orden de acumulación de antes, y el decode sigue dando los
+     * mismos bits. */
+    const int64_t nslots = rows * c->topk;
+    int *uniq = (int *)malloc((size_t)nslots * sizeof(int));
+    int nu = 0;
+    for (int64_t i = 0; i < nslots; i++) {
+        int seen = 0;
+        for (int j = 0; j < nu; j++) if (uniq[j] == idx[i]) { seen = 1; break; }
+        if (!seen) uniq[nu++] = (int)idx[i];
+    }
+    if (w->prefetch) w->prefetch(w->fetch_ctx, w->layer, uniq, nu);
+
+    for (int u = 0; u < nu; u++) {
+        const int e = uniq[u];
+        DsV4W w1, w2, w3;
+        if (w->fetch) {
+            w->fetch(w->fetch_ctx, w->layer, e, &w1, &w2, &w3);
+        } else if (w->store) {
+            /* Del disco, con caché LRU. El resto del cálculo es idéntico:
+             * de dónde vinieron los bytes no puede cambiar el resultado. */
+            const int64_t per = (int64_t)c->inter * c->dim;
+            const float *blk = dsv4_store_get(w->store, w->layer, e);
+            w1 = dsv4_w_f32(blk,           c->inter, c->dim);
+            w2 = dsv4_w_f32(blk + per,     c->dim,   c->inter);
+            w3 = dsv4_w_f32(blk + 2 * per, c->inter, c->dim);
+        } else {
+            w1 = w->e_w1[e]; w2 = w->e_w2[e]; w3 = w->e_w3[e];
         }
+        /* Ya está en RAM: se gasta en todas las filas que lo pidieron antes de
+         * que la caché pueda expulsarlo. Es la razón de ser de la unión. */
+        for (int64_t r = 0; r < rows; r++)
+            for (int k = 0; k < c->topk; k++)
+                if (idx[r * c->topk + k] == e)
+                    dsv4_expert_apply(c, &w1, &w2, &w3, x + r * c->dim,
+                                      wt[r * c->topk + k], out + r * c->dim);
+    }
+    free(uniq);
+
+    /* El compartido va SIEMPRE y con peso 1, después de los rutados. */
+    for (int64_t r = 0; r < rows; r++)
         dsv4_expert_apply(c, &w->s_w1, &w->s_w2, &w->s_w3,
                           x + r * c->dim, 1.0f, out + r * c->dim);
-    }
     free(idx); free(wt);
 }
 
