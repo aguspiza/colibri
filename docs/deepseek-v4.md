@@ -1,12 +1,29 @@
 # DeepSeek-V4-Flash-0731 — port en curso
 
-Estado del trabajo para añadir **DeepSeek-V4-Flash** (284B / 13B activos,
-contexto de 1M) como familia hermana de colibrì.
+**DeepSeek-V4-Flash** (284B / 13B activos, contexto de 1M) como familia hermana
+de colibrì. El motor **corre y genera texto**:
 
-> **Esto no es un motor terminado.** No existe `c/deepseek_v4.c`: lo que hay son
-> las primitivas de la arquitectura, cada una validada contra la implementación
-> de referencia de DeepSeek, y dos parches a colibrì sin los cuales el
-> checkpoint ni siquiera se abre. Lo que falta está listado al final.
+```
+$ ./deepseek_v4 /modelos/DeepSeek-V4-Flash-0731 "La capital de Francia es" 6
+config: 43 capas, dim 4096, 64 cabezas x 512, 256 expertos top-6
+expertos: streaming con cache de 384 slots de 11008 totales
+cargado en 7.5 s
+
+La capital de Francia es una de las ciudades más visitadas
+
+12 tokens en 76.8 s (0.16 tok/s)
+expertos: 1300 hits / 1796 miss, 24.01 GB leidos
+```
+
+En un Ryzen 5700U (Zen 2, **sin AVX-512**) con 17,4 GB de RAM libre y el
+checkpoint en un NVMe. 0,16 tok/s es lento, y se explica: ~2 GB de expertos
+leídos por token y la ruta SIMD de `quant.h` cayendo a AVX2.
+
+> **Sigue siendo trabajo en curso.** El forward está entero y validado pieza a
+> pieza contra la implementación de referencia de DeepSeek, pero falta la pila
+> MTP/DSpark, el enganche con `coli`, y el streaming real de colibrì (pool de
+> hilos, PILOT, batch-union, `O_DIRECT`, dual-SSD) en lugar de la caché LRU
+> mínima que trae `deepseek_v4.c`. Lista completa al final.
 
 ## Por qué encaja bien
 
@@ -103,10 +120,26 @@ DeepSeek la publica en UE8M0 de 1 byte. `dsv4_fp8.h` es el decodificador que
 faltaba. Cuidado con la convención **OCP E4M3-FN**: `exp==0xF` no está reservado
 para infinito —sólo `mant==0x7` lo es— así que el máximo finito es 448.
 
+## Reparto de memoria
+
+Es la decisión de diseño central, y la que hace que quepa:
+
+```
+residente en RAM    8,67 GiB   atención, normas, routers, expertos compartidos,
+                               embeddings y lm_head — EN SU FORMATO NATIVO
+por streaming     137,10 GiB   los 11.008 expertos rutados, del NVMe, con LRU
+```
+
+Los descriptores de `dsv4_weight.h` hacen que el matmul lea FP8/BF16/MXFP4
+directamente y **nunca materialice la matriz dequantizada**. Dequantizar el
+denso a f32 serían 26,8 GiB y no cabría. Es la misma decisión que toma colibrì
+con su struct `QT`.
+
 ## Lo que falta
 
-- **`c/deepseek_v4.c`**: el motor hermano que una todo esto y hable con `coli`.
-  Las piezas están; falta el cargador de las 43 capas y el bucle.
+- **Integración con `coli`**: `deepseek_v4.c` es autónomo (carga, tokeniza,
+  genera). Falta que el launcher lo reconozca por `model_type` y que hable el
+  protocolo del gateway.
 - **MTP / DSpark**: 4.705 tensores (6,5 %). Son 3 bloques con `markov_head` y
   `confidence_head` — la pila MTP *es* la implementación de DSpark. Es un
   acelerador: el modelo genera sin ella.

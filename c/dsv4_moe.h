@@ -37,6 +37,13 @@ typedef struct {
      * colibrì entre el conjunto denso y el tier rutado. */
     DsV4Store *store;
     int layer;                          /* qué capa pedirle al store */
+
+    /* Tercera vía: un callback que devuelve los descriptores del experto. Lo
+     * usa el motor real, donde los expertos viven en los shards del checkpoint
+     * y hay una caché LRU por medio. Se hace con puntero a función para que
+     * `dsv4_moe.h` no tenga que conocer `st.h` ni la política de caché. */
+    void (*fetch)(void *ctx, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4W *w3);
+    void *fetch_ctx;
 } DsV4MoeW;
 
 /* ---------------------------------------------------------------------------
@@ -157,7 +164,9 @@ static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
         for (int k = 0; k < c->topk; k++) {
             const int e = idx[r * c->topk + k];
             DsV4W w1, w2, w3;
-            if (w->store) {
+            if (w->fetch) {
+                w->fetch(w->fetch_ctx, w->layer, e, &w1, &w2, &w3);
+            } else if (w->store) {
                 /* Del disco, con caché LRU. El resto del cálculo es idéntico:
                  * de dónde vinieron los bytes no puede cambiar el resultado. */
                 const int64_t per = (int64_t)c->inter * c->dim;
