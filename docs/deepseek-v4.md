@@ -10,9 +10,9 @@ expertos: streaming con cache de 512 slots de 11008 totales
 
 La capital de Francia es una de las ciudades más visitadas del mundo
 
-14 tokens en 27.5 s (0.51 tok/s)
-perfil (total): atencion 9.0 s | MoE 17.6 s | head 0.3 s | resto 0.5 s
-  del MoE, 12.3 s son I/O de expertos y 5.4 s computo
+14 tokens en 21.6 s (0.65 tok/s)
+perfil (total): atencion 4.4 s | MoE 16.5 s | head 0.3 s | resto 0.5 s
+  del MoE, 12.2 s son I/O de expertos y 4.3 s computo
 expertos: 1765 hits / 1847 miss (49% acierto), 24.69 GB leidos
 ```
 
@@ -26,10 +26,10 @@ claro, y no era el que yo suponía:
 
 | | antes | ahora | qué pasaba |
 |---|---|---|---|
-| Atención | 35,5 s (55 %) | **5,8 s** | mi kernel FP8 era C escalar de un hilo |
+| Atención | 35,5 s (55 %) | **4,4 s** | kernel FP8 escalar, y luego un `gather` |
 | `lm_head` | 1,9 s | **0,3 s** | ídem, en BF16 |
-| MoE cómputo | 11,1 s | **4,4 s** | el router BF16, también escalar |
-| MoE I/O | 15,9 s | 15,9 s | sin cambio: el disco manda |
+| MoE cómputo | 11,1 s | **4,3 s** | el router BF16, también escalar |
+| MoE I/O | 15,9 s | **12,2 s** | las lecturas se serializaban (ver abajo) |
 
 El MoE ya iba rápido porque usa `matmul_mxfp4` de colibrì, que sí trae AVX2. El
 resto lo había escrito yo priorizando que fuese legible y verificable contra la
@@ -37,8 +37,30 @@ referencia, y se notaba: la atención hacía 4,6 GMAC/token en 3,5 s mientras el
 MoE hacía 6,5 GMAC en 1,1 s — **4,5× más lento por MAC**.
 
 Vectorizar (AVX2+FMA) y repartir las filas de salida entre los 8 núcleos da
-**2,6× en total**. Los errores contra la referencia no se mueven ni un dígito
+**2,6×**. Los errores contra la referencia no se mueven ni un dígito
 (FP8 4,82e-07, MoE 1,67e-03): el orden de acumulación cambia, la precisión no.
+
+### El `gather` costaba otro 2x
+
+Vectorizado, el kernel FP8 seguía dando **14 GFLOP/s** mientras el MXFP4 de este
+repo saca 33 sobre el mismo hardware. La atención relee sus 5,40 GB de pesos
+residentes en cada token, y eso salían 8,4 GB/s efectivos: demasiado poco para
+ser un límite de RAM.
+
+La causa era decodificar e4m3 con `_mm256_i32gather_ps` sobre una LUT de 256
+floats. Cabe en L1, pero **en Zen 2 el gather se ejecuta como 8 accesos
+secuenciados y no se encadena**. Sale mucho mejor con aritmética de bits: para
+`exp != 0` basta `mag << 20` —que deja la mantisa en 22..20 y el exponente en
+26..23— y sumar `120 << 23` para corregir el sesgo (e4m3 usa 7, f32 usa 127);
+para `exp == 0` el valor es subnormal y vale `mant * 2^-9`.
+
+Atención **9,0 -> 4,4 s**, o sea 18 GB/s: ahora sí es el ancho de banda de la
+memoria. Mismo error contra la referencia, 4,82e-07.
+
+Detalle de formato: `mag == 0x7F` es NaN en OCP E4M3-FN y la fórmula aritmética
+daría 480. Se respeta con un `blend`, aunque el checkpoint no traiga ninguno
+(comprobado: el máximo es 0x7E = 448) — si un día aparece, mejor que se propague
+a que se lea como un número válido.
 
 ## Un handle por hilo, o el disco va a un tercio
 
@@ -87,9 +109,21 @@ mismo solapamiento. Simulando la política de caché sobre la traza de ruteo rea
 
 Agrupar **empeora**. En orden secuencial cada capa se revisita cada 258 accesos
 y con 512 slots eso cabe; en lotes de 5 se revisita cada 724 y no cabe, así que
-la agrupación convierte aciertos de caché en deduplicación y encima pierde. Con
-una caché que sostuviera el conjunto de trabajo del lote (~9,7 GB) se daría la
-vuelta, pero no cabe en esta máquina.
+la agrupación convierte aciertos de caché en deduplicación y encima pierde.
+
+Y no es cuestión de tener más RAM. Barriendo el tamaño de caché en el simulador,
+agrupar **no gana nunca**:
+
+| caché | secuencial | lote 5 | lote 8 |
+|---|---|---|---|
+| 512 (6,9 GB) | **124,2** | 151,6 | 129,1 |
+| 1024 (13,7 GB) | **101,5** | 105,4 | 110,4 |
+| ≥2048 (27 GB+) | **86,0** | 86,0 | 86,0 |
+
+A partir de ~2.048 slots los fallos se saturan en los *obligatorios* —cada
+experto distinto se lee una vez— y ahí no hay nada que agrupar pueda mejorar.
+El único ahorro que quedaría es amortizar los 5,40 GB/token de pesos de
+atención, y ése se ataca más barato arreglando el kernel (ver arriba).
 
 `dsv4_moe.h` implementa igualmente el recorrido por **unión** de expertos —cada
 uno se aplica a todas las filas que lo eligieron— porque es correcto y hace

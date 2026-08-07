@@ -104,14 +104,42 @@ static inline void dsv4_matmul_fp8_ue8m0(float *y, const float *x,
                 float part = 0.0f;
                 int i = i0;
 #if defined(__AVX2__) && defined(__FMA__)
-                /* Los bytes e4m3 se decodifican por `gather` sobre la LUT de 256
-                 * floats: cabe entera en L1, que es la razón de que el gather
-                 * salga a cuenta aquí y no en general. */
+                /* e4m3 -> f32 con ARITMÉTICA, sin tabla.
+                 *
+                 * La versión anterior hacía `_mm256_i32gather_ps` sobre la LUT
+                 * de 256 floats. Cabe en L1, pero en Zen 2 el gather se ejecuta
+                 * como 8 accesos secuenciados y no se encadena: era el motivo
+                 * de que este kernel rindiera 14 GFLOP/s cuando el MXFP4 de
+                 * colibrì saca 33 sobre el mismo hardware.
+                 *
+                 * Para exp != 0 basta recolocar los bits: `mag << 20` deja la
+                 * mantisa en 22..20 y el exponente en 26..23, y sumar 120<<23
+                 * corrige el sesgo (e4m3 usa 7, f32 usa 127).
+                 * Para exp == 0 el formato es subnormal y vale mant * 2^-9, que
+                 * sale de convertir el entero y escalar.
+                 * `mag == 0x7F` es NaN en OCP E4M3-FN; el checkpoint no trae
+                 * ninguno (comprobado), pero se respeta: si un día aparece uno,
+                 * que se propague en vez de leerse como 480. */
+                const __m256i k7F  = _mm256_set1_epi32(0x7F);
+                const __m256i k80  = _mm256_set1_epi32(0x80);
+                const __m256i kbia = _mm256_set1_epi32(120 << 23);
+                const __m256i k8   = _mm256_set1_epi32(8);
+                const __m256  ksub = _mm256_set1_ps(1.0f / 512.0f);   /* 2^-9 */
+                const __m256  knan = _mm256_set1_ps(NAN);
                 __m256 va = _mm256_setzero_ps();
                 for (; i + 8 <= i1; i += 8) {
-                    const __m256i idx =
+                    const __m256i v =
                         _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(row + i)));
-                    const __m256 wv = _mm256_i32gather_ps(g_dsv4_e4m3, idx, 4);
+                    const __m256i mag = _mm256_and_si256(v, k7F);
+                    const __m256i sgn = _mm256_slli_epi32(_mm256_and_si256(v, k80), 24);
+                    const __m256  nrm = _mm256_castsi256_ps(
+                        _mm256_add_epi32(_mm256_slli_epi32(mag, 20), kbia));
+                    const __m256  sub = _mm256_mul_ps(_mm256_cvtepi32_ps(mag), ksub);
+                    __m256 wv = _mm256_blendv_ps(nrm, sub,
+                        _mm256_castsi256_ps(_mm256_cmpgt_epi32(k8, mag)));
+                    wv = _mm256_blendv_ps(wv, knan,
+                        _mm256_castsi256_ps(_mm256_cmpeq_epi32(mag, k7F)));
+                    wv = _mm256_or_ps(wv, _mm256_castsi256_ps(sgn));
                     va = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i), wv, va);
                 }
                 {   /* suma horizontal */
