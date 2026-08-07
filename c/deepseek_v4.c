@@ -38,6 +38,8 @@
 #include "quant.h"
 #include "tok.h"
 
+#include "omp_tune.h"   /* squadra sui core fisici: ver la nota en main() */
+
 #include "dsv4_fp8.h"
 #include "dsv4_weight.h"
 #include "dsv4_attn.h"
@@ -1076,6 +1078,17 @@ static void serve_loop(Run *R) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* Dimensiona el equipo OpenMP a los núcleos FÍSICOS, sin SMT. Medido aquí:
+     * 19,0 s con 16 hilos lógicos frente a 17,1 s con 8 físicos, y encima la
+     * espera de I/O baja de 8,8 a 6,6 s porque los lectores dejan de pelearse
+     * con el cálculo por los mismos núcleos. Con 4 se pierde por el otro lado.
+     *
+     * `omp_tune.h` toma SÓLO el dimensionamiento y deja fuera el spin-wait a
+     * propósito: en un motor que saca los tokens del disco, un equipo girando
+     * en vacío le roba los núcleos al I/O que hace el trabajo de verdad. Este
+     * motor está en ese régimen (el I/O es el 40 % del tiempo). */
+    coli_omp_tune_threads("deepseek_v4");
 
     /* La pasarela lanza el motor con SNAP=<dir>, SERVE=1 y NGEN=<max_tokens>,
      * y le pasa el `cap` de la caché como argv[1]. */
