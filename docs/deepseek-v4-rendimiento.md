@@ -283,17 +283,48 @@ tocar la cuota de working set del proceso.
 
 Los tres modos generan **el mismo texto**.
 
+## El equipo OpenMP, sobre los núcleos físicos
+
+`kimi_k3.c` y `olmoe.c` ya llamaban a `coli_omp_tune_threads` al arrancar; este
+motor no, y corría con los 16 hilos lógicos:
+
+| hilos | tiempo | espera de I/O | cómputo MoE |
+|---|---|---|---|
+| 16 (lógicos) | 19,0 s | 8,8 s | 5,3 s |
+| **8 (físicos)** | **17,1 s** | **6,6 s** | 5,6 s |
+| 4 | 19,0 s | 5,6 s | 6,9 s |
+
+Un 11 % gratis. Y lo interesante es que además baja la **espera de I/O**: el pool
+de lectores se dimensiona con `omp_get_max_threads()`, así que al encoger el
+equipo los lectores dejan de pelearse con el cálculo por los mismos núcleos.
+
+`omp_tune.h` toma sólo el dimensionamiento y deja fuera el *spin-wait* a
+propósito, y este motor es justo el caso que lo justifica: con el I/O en el 40 %
+del tiempo, un equipo girando en vacío le robaría los núcleos al trabajo real.
+
 ## Qué queda
 
-- **El I/O sigue siendo el 49 %** del tiempo (9,7 s de 20,0). El suelo son los
-  expertos distintos que hay que leer sí o sí: 1.529 en 14 tokens, unos 20,5 GB,
-  que a 2,9 GB/s son ~7 s. Estamos cerca.
-- **Eliminar la copia**: hoy los bytes van del disco a la caché de páginas y de
-  ahí a nuestros buffers. Mapear los shards en memoria (`mmap` /
-  `MapViewOfFile`) y apuntar el kernel MXFP4 directamente a las páginas
-  eliminaría la copia *y* la duplicación de caché de un tirón. Es el cambio con
-  más recorrido que queda, y encaja con lo que ya hace colibrì con sus gemelos
-  `O_DIRECT`.
+- **El I/O es el 39 %** del tiempo (6,6 s de 16,8). El suelo son los expertos
+  distintos que hay que leer sí o sí: 1.529 en 14 tokens, unos 20,5 GB, que a
+  2,9 GB/s son ~7 s. Estamos prácticamente en él.
+- **Un segundo SSD sería la única palanca grande que queda.** colibrì ya trae
+  toda la maquinaria y es agnóstica al modelo: `COLI_MODEL_DIRS` reparte los
+  shards entre unidades (cada una con un subconjunto **distinto**, sin
+  duplicar), `COLI_MODEL_MIRROR` mantiene copias y reparte las lecturas entre
+  ellas, y `COLI_DISK_WEIGHTS` fija el reparto —o lo mide con una sonda de ancho
+  de banda al arrancar—. Como las lecturas de expertos ya van por un pool de
+  hilos con un descriptor por hilo, se paralelizarían entre unidades casi solas.
+  Con dos NVMe parecidos el techo pasaría de 2,9 a ~5,5 GB/s y el I/O caería a
+  la mitad: **~13 s en vez de 16,8, o sea 1,05 tok/s**.
+  Encima está `coli mirror`, que ordena por uso con `.coli_usage` y deja los
+  expertos calientes en la unidad rápida — encaja con lo medido, que el tráfico
+  se concentra en pocos expertos distintos.
+  *No sirve con las unidades actuales:* D: y E: son discos USB mecánicos, mucho
+  más lentos que el NVMe, así que repartir hacia ellos empeoraría salvo con
+  pesos muy asimétricos.
+- **Lo que NO queda**: mapear en memoria (medido, pierde), agrandar la caché
+  (medido, plano), agrupar tokens y MTP/DSpark (medido, pierde). Cada uno con
+  su porqué más arriba.
 - **Solapar mejor**: la atención de la capa L+1 depende del MoE de la capa L, así
   que la cadena `attn -> router -> lectura -> MoE` es intrínsecamente serie. El
   único solape posible es el que ya se hace dentro de la capa.
