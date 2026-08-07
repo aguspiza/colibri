@@ -63,6 +63,108 @@ static FILE *g_trace;   /* DSV4_TRACE=fichero -> vuelca (token,capa,experto) */
 static int g_tok_no;
 
 /* ---------------------------------------------------------------------------
+ * Política de carga, al estilo del `--load-mode` de llama.cpp.
+ *
+ * Hay dos poblaciones de pesos con regímenes OPUESTOS, y por eso no vale una
+ * respuesta única:
+ *
+ *   denso, 8,67 GB   se lee en CADA token. Sus páginas fallan una vez y se
+ *                    quedan residentes para siempre -> mapear gana: la carga
+ *                    es perezosa y no se duplican 8,67 GB entre el montón y la
+ *                    caché de páginas.
+ *   expertos, 137 GB cada región se toca una vez y se descarta -> mapear
+ *                    PIERDE. Medido: 23,7 s frente a 18,9. Los buffers de los
+ *                    slots se reutilizan y sus páginas no vuelven a fallar,
+ *                    mientras que el mapeo falla en cada región nueva: 13,4 MB
+ *                    por experto son ~3.400 fallos de 4 KB. Cambiar un memcpy
+ *                    por 3.400 entradas al kernel no sale a cuenta.
+ *
+ * Mapear no sale gratis pero compra MEMORIA PRIVADA, que es lo que de verdad
+ * limita a quién le cabe el modelo. Medido con 14 tokens:
+ *
+ *   DSV4_LOAD   privado   working set   tiempo
+ *   read         13,2 GB      13,2 GB    19,3 s   <- por defecto, lo más rápido
+ *   dense         5,4 GB      12,2 GB    21,5 s   +11 %, -7,8 GB privados
+ *   all           0,6 GB      24,7 GB    24,4 s   +26 %, corre en casi nada
+ *
+ * Lo que compra `dense` no es memoria libre —el working set apenas baja— sino
+ * que esos 8,67 GB pasan de anónimos a respaldados por fichero: bajo presión el
+ * SO los DESCARTA en vez de mandarlos al swap. `all` lleva al proceso a 0,6 GB
+ * privados a cambio de llenar el working set y de un 26 % de tiempo.
+ *
+ * Es la misma razón por la que llama.cpp mantiene `--load-mode` en vez de
+ * elegir por ti: no hay una respuesta buena para todas las máquinas.
+ * ------------------------------------------------------------------------- */
+typedef enum { LOAD_READ = 0, LOAD_DENSE = 1, LOAD_ALL = 2 } LoadMode;
+
+static LoadMode load_mode(void) {
+    const char *s = getenv("DSV4_LOAD");
+    if (!s || !strcmp(s, "read")) return LOAD_READ;      /* por defecto */
+    if (!strcmp(s, "dense")) return LOAD_DENSE;
+    if (!strcmp(s, "all"))   return LOAD_ALL;
+    fprintf(stderr, "DSV4_LOAD debe ser read|dense|all\n");
+    exit(1);
+}
+
+#ifdef _WIN32
+static uint8_t *map_file(const char *path, uint64_t *len) {
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); return NULL; }
+    HANDLE m = CreateFileMappingA(h, NULL, PAGE_READONLY, 0, 0, NULL);
+    CloseHandle(h);                      /* la vista mantiene vivo el fichero */
+    if (!m) return NULL;
+    void *p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(m);
+    if (p) *len = (uint64_t)sz.QuadPart;
+    return (uint8_t *)p;
+}
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+static uint8_t *map_file(const char *path, uint64_t *len) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st)) { close(fd); return NULL; }
+    void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return NULL;
+    *len = (uint64_t)st.st_size;
+    return (uint8_t *)p;
+}
+#endif
+
+/* Los shards mapeados. Es seguro apuntar el kernel a offsets arbitrarios:
+ * `quant.h` no usa ni una carga alineada, sólo `loadu` (49 de 49). */
+static uint8_t **g_smap;
+
+static void smap_init(shards *S) {
+    g_smap = calloc((size_t)S->nfd, sizeof(uint8_t *));
+    for (int i = 0; i < S->nfd; i++) {
+        uint64_t len = 0;
+        g_smap[i] = map_file(S->paths[i], &len);
+        if (!g_smap[i]) {
+            fprintf(stderr, "no pude mapear %s; se cargara leyendo\n", S->paths[i]);
+            free(g_smap); g_smap = NULL;
+            return;
+        }
+    }
+}
+
+/* Puntero al tensor dentro del mapeo, o NULL si no hay mapeo. */
+static uint8_t *smap_ptr(shards *S, const char *nm) {
+    if (!g_smap) return NULL;
+    st_tensor *t = st_find(S, nm);
+    if (!t) { fprintf(stderr, "falta %s\n", nm); exit(1); }
+    for (int i = 0; i < S->nfd; i++)
+        if (S->fds[i] == t->fd) return g_smap[i] + t->off;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------------------
  * Tier de expertos por streaming.
  *
  * Un experto son 3 matrices MXFP4 + sus escalas = 13,4 MB. No caben los 11.008
@@ -92,6 +194,7 @@ typedef struct {
     int nslot;
     uint64_t clock, hits, miss;
     uint64_t bytes;
+    int mapped;             /* LOAD_ALL: sin buffers ni LRU, se lee del mapeo */
 
     /* UN DESCRIPTOR POR HILO Y SHARD.
      *
@@ -127,6 +230,8 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
     memset(T, 0, sizeof *T);
     T->S = S; T->n_layers = n_layers; T->n_experts = n_experts;
     T->inter = inter; T->dim = dim; T->cap = cap;
+    T->mapped = (load_mode() == LOAD_ALL && g_smap != NULL);
+    if (T->mapped) cap = T->cap = 1;   /* la caché la lleva el SO */
     T->slots = calloc((size_t)cap, sizeof(ExpSlot));
     for (int i = 0; i < cap; i++) { T->slots[i].layer = -1; T->slots[i].expert = -1; }
 
@@ -301,6 +406,30 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
 {
     int slot[16], want[16], nw = 0;
     if (n > 16) n = 16;
+    if (T->mapped) {
+        /* Se le PIDE al SO que traiga los rangos, sin tocarlos: tocarlos
+         * costaría el mismo ancho de banda que leerlos. Es una pista, no una
+         * garantía; si la página no ha llegado, el fallo se resuelve al leer. */
+#ifdef _WIN32
+        WIN32_MEMORY_RANGE_ENTRY r[16 * 6];
+        int nr = 0;
+        for (int k = 0; k < n; k++) {
+            const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + es[k]) * 6];
+            for (int j = 0; j < 6; j++, nr++) {
+                r[nr].VirtualAddress = g_smap[d[j].shard] + d[j].off;
+                r[nr].NumberOfBytes  = (SIZE_T)d[j].nb;
+            }
+        }
+        if (nr) PrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR)nr, r, 0);
+#else
+        for (int k = 0; k < n; k++) {
+            const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + es[k]) * 6];
+            for (int j = 0; j < 6; j++)
+                madvise(g_smap[d[j].shard] + d[j].off, (size_t)d[j].nb, MADV_WILLNEED);
+        }
+#endif
+        return;
+    }
     if (g_trace) for (int k = 0; k < n; k++)
         fprintf(g_trace, "%d %d %d\n", g_tok_no, layer, es[k]);
     for (int k = 0; k < n; k++) {
@@ -339,6 +468,22 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
  * el camino de carga queda como red de seguridad para quien no lo use. */
 static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4W *w3)
 {
+    if (T->mapped) {
+        /* Sin copia y sin caché propia: los descriptores apuntan a la página y
+         * la caché es la del SO. Cuesta ~25 % más tiempo (fallos de página por
+         * cada 4 KB de región nueva) y ahorra los GB de los buffers. */
+        const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6];
+        uint8_t *p[6];
+        for (int k = 0; k < 6; k++) {
+            p[k] = g_smap[d[k].shard] + d[k].off;
+            T->bytes += (uint64_t)d[k].nb;
+        }
+        *w1 = dsv4_w_mxfp4(p[0], p[1], T->inter, T->dim);
+        *w2 = dsv4_w_mxfp4(p[2], p[3], T->dim,   T->inter);
+        *w3 = dsv4_w_mxfp4(p[4], p[5], T->inter, T->dim);
+        return;
+    }
+
     int hit = tier_find(T, layer, e);
     if (hit < 0) {
         T->miss++;
@@ -408,13 +553,21 @@ static float *vec_f32(shards *S, const char *nm, int n) {
     free(r);
     return out;
 }
-/* matriz cuantizada: FP8 si tiene .scale, BF16 si no */
+/* Matriz cuantizada: FP8 si tiene .scale, BF16 si no.
+ *
+ * Es el grueso del conjunto denso (atención, embed, lm_head, compartidos), y
+ * sale del mapeo cuando lo hay: no se copia nada y la carga es perezosa. */
 static DsV4W mat_of(shards *S, const char *base, int O, int I) {
     char nw[192], ns[192];
     snprintf(nw, sizeof nw, "%s.weight", base);
     snprintf(ns, sizeof ns, "%s.scale", base);
-    uint8_t *wb = raw_of(S, nw);
-    if (st_has(S, ns)) return dsv4_w_fp8b(wb, raw_of(S, ns), O, I);
+    uint8_t *wb = smap_ptr(S, nw);
+    if (!wb) wb = raw_of(S, nw);
+    if (st_has(S, ns)) {
+        uint8_t *sb = smap_ptr(S, ns);
+        if (!sb) sb = raw_of(S, ns);
+        return dsv4_w_fp8b(wb, sb, O, I);
+    }
     return dsv4_w_bf16(wb, O, I);
 }
 
@@ -422,6 +575,7 @@ static void model_load(Model *M, const char *dir) {
     memset(M, 0, sizeof *M);
     double t0 = now_s();
     st_init(&M->S, dir);
+    if (load_mode() != LOAD_READ) smap_init(&M->S);
 
     /* --- config.json ---------------------------------------------------- */
     char cfgp[1024];

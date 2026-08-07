@@ -214,6 +214,75 @@ predecir *tiempo*.
 Consecuencia práctica: `DSV4_CACHE` existe para experimentar, pero subirlo no
 compensa. Una caché pequeña deja más RAM al SO, que la administra mejor.
 
+### Mapear los shards en memoria (para ganar velocidad)
+
+Con `pread` los bytes hacen dos viajes: disco → caché de páginas → nuestro
+buffer, y la copia se paga incluso cuando la página ya estaba en RAM. Mapear los
+shards y apuntar el kernel MXFP4 directamente a la página parecía eliminar de un
+tirón la copia *y* la duplicación de caché. Es seguro además: `quant.h` no usa
+ni una carga alineada, sólo `loadu` (49 de 49).
+
+Implementado con `CreateFileMapping`/`MapViewOfFile` y `PrefetchVirtualMemory`
+para pedirle al SO los rangos por adelantado —sin tocarlos, que costaría el
+mismo ancho de banda que leerlos— sale **peor**: 23,7 s frente a 19,4.
+
+El perfil explica el porqué: la espera de I/O baja a 0,0 s pero el cómputo del
+MoE se dispara de 5,1 a 18,4 s. Los fallos de página ocurren *dentro* del
+matmul. Y el motivo es estructural:
+
+**Los buffers de los slots se reutilizan, así que sus páginas se mapean una vez
+y no vuelven a fallar nunca. El mapeo falla en cada región nueva** — 13,4 MB por
+experto son ~3.400 fallos de 4 KB, cada uno una entrada al kernel. Cambiar un
+`memcpy` (10-20 GB/s, sin entrar al kernel) por 3.400 trampas por experto no
+sale a cuenta ni de lejos. `PrefetchVirtualMemory` los convierte en fallos
+blandos, pero blandos siguen costando ~1 µs cada uno.
+
+La lección general: **mmap gana cuando las páginas se reutilizan y pierde cuando
+se recorren datos nuevos constantemente**, que es exactamente el patrón de un
+tier de expertos por streaming.
+
+## `DSV4_LOAD`: mapear no compra velocidad, compra memoria privada
+
+Descartar mmap por lento habría sido un error, porque el eje que importa no era
+ése. `--no-mmap` de llama.cpp hacía dos cosas a la vez y en las versiones
+recientes está deprecado en favor de `--load-mode`
+(`none | mmap | mlock | mmap+mlock | dio`), precisamente porque **no hay una
+respuesta buena para todas las máquinas**. Aquí pasa lo mismo.
+
+Medido sobre 14 tokens, promediando dos pasadas:
+
+| `DSV4_LOAD` | privado | working set | libre del sistema | tiempo |
+|---|---|---|---|---|
+| `read` (por defecto) | 13,2 GB | 13,2 GB | 8,2 GB | **19,3 s** |
+| `dense` | **5,4 GB** | 12,2 GB | 8,4 GB | 21,5 s |
+| `all` | **0,6 GB** | 24,7 GB | 0,6 GB | 24,4 s |
+
+- **`read`** — todo con `pread` a buffers propios. Lo más rápido.
+- **`dense`** — mapea el conjunto denso (atención, `embed`, `lm_head`,
+  compartidos) y deja los expertos con `pread`. Cada población con la política
+  que le conviene. Baja la memoria privada 7,8 GB por un 11 % de tiempo.
+- **`all`** — mapea también los expertos y quita la caché LRU entera. El proceso
+  se queda en **0,6 GB privados**: cabe en máquinas donde `read` ni arranca, a
+  cambio de un 26 %.
+
+El matiz importante es **qué compra `dense` exactamente**. No baja el working
+set —las páginas siguen residentes, sólo que compartidas con la caché del SO—
+sino que convierte 8,67 GB de memoria **anónima** en memoria **respaldada por
+fichero**. Bajo presión, el SO puede descartarlas y releerlas del disco en vez
+de mandarlas al fichero de paginación. Es más robusto, no más libre.
+
+Y cuidado con la métrica: el primer intento midió *working set* y salía que
+mapear **aumentaba** el consumo (24,9 GB) porque las páginas de fichero tocadas
+cuentan en el working set del proceso. Para «cuánta RAM necesita este proceso»
+hay que mirar **bytes privados**.
+
+Lo que no está implementado es el segundo eje de llama.cpp, el de residencia
+(`mlock` / `VirtualLock`). Aquí importa poco: el conjunto denso se toca en cada
+token, así que se queda residente por su cuenta, y fijarlo en Windows exige
+tocar la cuota de working set del proceso.
+
+Los tres modos generan **el mismo texto**.
+
 ## Qué queda
 
 - **El I/O sigue siendo el 49 %** del tiempo (9,7 s de 20,0). El suelo son los
