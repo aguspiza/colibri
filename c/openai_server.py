@@ -493,6 +493,52 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(parts)
 
 
+def render_chat_deepseek(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                         tool_choice=None):
+    """DeepSeek-V4-Flash chat format.
+
+    The checkpoint ships **no** chat_template.jinja, but its vocabulary carries
+    the V3/R1 role tokens -- <|User|> 128803, <|Assistant|> 128804, and
+    <|end_of_sentence|> 1 as the turn terminator (all written with the
+    fullwidth bar U+FF5C and U+2581 word joiners, which is why they are spelled
+    out literally below). tok.h treats added_tokens as atomic, so these survive
+    encode/decode as single ids.
+
+    The system message goes in raw ahead of the first turn, the way V3 does it:
+    there is no dedicated system role token in the trained format.
+
+    BOS is NOT emitted here -- deepseek_v4.c prepends it itself, the same as it
+    does for a plain CLI prompt.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the DeepSeek-V4 engine yet.",
+                       "tools", "unsupported_parameter")
+    user_tok = "<｜User｜>"
+    asst_tok = "<｜Assistant｜>"
+    eos_tok = "<｜end▁of▁sentence｜>"
+    parts = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            parts.append(text)
+        elif role == "user":
+            parts.append(f"{user_tok}{text}")
+        else:
+            parts.append(f"{asst_tok}{text}{eos_tok}")
+    parts.append(asst_tok)
+    if enable_thinking:
+        parts.append("<think>")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -552,6 +598,19 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     if eff == 0.0:
         prompt.append("<|content_text|>")
     return "".join(prompt)
+
+
+def chat_renderer():
+    """The renderer for the active ARCH.
+
+    Both entry points (/v1/chat/completions and /v1/messages) go through this:
+    the Anthropic branch used to hardcode render_chat, so a non-glm model got
+    GLM role markup its tokenizer had never seen and answered with a stray
+    control token.
+    """
+    return (render_chat_inkling if ARCH == "inkling" else
+            render_chat_kimi if ARCH == "kimi" else
+            render_chat_deepseek if ARCH == "deepseek" else render_chat)
 
 
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -1164,6 +1223,8 @@ def model_arch(model):
         return "inkling"
     if "kimi" in model_type:
         return "kimi"
+    if "deepseek" in model_type:
+        return "deepseek"
     return "glm"
 
 
@@ -2078,8 +2139,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = (render_chat_inkling if ARCH == "inkling" else
-                    render_chat_kimi if ARCH == "kimi" else render_chat)
+        renderer = chat_renderer()
         prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                           tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
@@ -2114,8 +2174,8 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
-                             tools, tool_choice)
+        prompt = chat_renderer()(messages, enable_thinking,
+                                 "high" if enable_thinking else None, tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
@@ -2388,7 +2448,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2416,7 +2476,8 @@ def main():
     if ARCH == "auto":
         ARCH = model_arch(args.model)
     if args.model_id is None:
-        args.model_id = ("inkling-colibri" if ARCH == "inkling" else
+        args.model_id = ("deepseek-v4-colibri" if ARCH == "deepseek" else
+                         "inkling-colibri" if ARCH == "inkling" else
                          "kimi-k3-colibri" if ARCH == "kimi" else "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,

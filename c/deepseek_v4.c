@@ -61,6 +61,9 @@ static uint8_t g_seen[(43 * 256 + 7) / 8];   /* capas x expertos, 1 bit cada uno
 static uint64_t g_distinct;
 static FILE *g_trace;   /* DSV4_TRACE=fichero -> vuelca (token,capa,experto) */
 static int g_tok_no;
+/* `cap` de la pasarela: en colibrì significa slots de caché POR CAPA, no en
+ * total. Se multiplica por n_layers al construir el tier. */
+static int g_cache_per_layer;
 
 /* ---------------------------------------------------------------------------
  * Política de carga, al estilo del `--load-mode` de llama.cpp.
@@ -522,6 +525,7 @@ typedef struct {
     ExpertTier tier;
 
     int n_layers, dim, vocab, hc, n_hash, sinkhorn_iters;
+    int bos, eos;           /* del config.json: 0 y 1 en este checkpoint */
     float norm_eps, hc_eps;
     int *ratios;
 
@@ -593,6 +597,8 @@ static void model_load(Model *M, const char *dir) {
     M->n_layers = GI("num_hidden_layers");
     M->dim      = GI("hidden_size");
     M->vocab    = GI("vocab_size");
+    M->bos      = GI("bos_token_id");
+    M->eos      = GI("eos_token_id");
     M->hc       = GI("hc_mult");
     M->n_hash   = GI("num_hash_layers");
     M->sinkhorn_iters = GI("hc_sinkhorn_iters");
@@ -619,8 +625,10 @@ static void model_load(Model *M, const char *dir) {
 #undef GI
 #undef GF
 
-    printf("config: %d capas, dim %d, %d cabezas x %d, %d expertos top-%d\n",
-           M->n_layers, M->dim, heads, hd, n_exp, topk);
+    /* Los diagnosticos van a stderr SIEMPRE: en modo serve, stdout es el
+     * protocolo, y una linea suelta ahi descoloca a la pasarela. */
+    fprintf(stderr, "config: %d capas, dim %d, %d cabezas x %d, %d expertos top-%d\n",
+            M->n_layers, M->dim, heads, hd, n_exp, topk);
 
     /* --- freqs_cis con YaRN --------------------------------------------- */
     M->max_seq = 2048;                 /* suficiente para prompts de prueba */
@@ -722,16 +730,17 @@ static void model_load(Model *M, const char *dir) {
         w->moe.s_w3 = mat_of(&M->S, B("layers.%d.ffn.shared_experts.w3", L), inter, M->dim);
 #undef B
         if ((L + 1) % 8 == 0 || L == M->n_layers - 1)
-            printf("\r  capas cargadas: %d/%d", L + 1, M->n_layers), fflush(stdout);
+            fprintf(stderr, "\r  capas cargadas: %d/%d", L + 1, M->n_layers), fflush(stderr);
     }
-    printf("\n");
+    fprintf(stderr, "\n");
 
     /* --- tier de expertos ------------------------------------------------ */
     /* ~13,4 MB por experto. El tamaño manda sobre el I/O, que es el cuello de
      * botella real, así que se deja ajustable para poder medirlo. */
     { const char *tp = getenv("DSV4_TRACE"); if (tp) g_trace = fopen(tp, "w"); }
     const char *cenv = getenv("DSV4_CACHE");
-    const int cache = cenv ? atoi(cenv) : 384;
+    const int cache = cenv ? atoi(cenv)
+                     : (g_cache_per_layer ? g_cache_per_layer * M->n_layers : 384);
     tier_init(&M->tier, &M->S, M->n_layers, n_exp, inter, M->dim, cache);
     /* Cada capa pide sus expertos al tier por callback: el MoE no sabe nada de
      * shards ni de política de caché. */
@@ -741,9 +750,9 @@ static void model_load(Model *M, const char *dir) {
         M->w[L].moe.fetch_ctx = &M->tier;
         M->w[L].moe.layer = L;
     }
-    printf("expertos: streaming con cache de %d slots de %d totales\n",
-           cache, M->n_layers * n_exp);
-    printf("cargado en %.1f s\n\n", now_s() - t0);
+    fprintf(stderr, "expertos: streaming con cache de %d slots de %d totales\n",
+            cache, M->n_layers * n_exp);
+    fprintf(stderr, "cargado en %.1f s\n\n", now_s() - t0);
 }
 
 /* ---------------------------------------------------------------------------
@@ -790,8 +799,283 @@ static void model_layer_decode(Model *M, int L, DsV4AttnState *st,
     free(coll); free(sub); free(mid); free(tmp);
 }
 
+/* ---------------------------------------------------------------------------
+ * Un pase de decode reutilizable.
+ *
+ * Lo comparten el modo CLI y el modo serve: la única diferencia entre generar
+ * desde la línea de órdenes y desde la pasarela HTTP es de dónde viene el
+ * prompt y a dónde van los tokens.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    Model *M;
+    DsV4AttnState *st;
+    float *h, *h2, *logits, *emb;
+    int pos;
+} Run;
+
+static void run_init(Run *R, Model *M) {
+    memset(R, 0, sizeof *R);
+    R->M = M;
+    R->st = calloc((size_t)M->n_layers, sizeof(DsV4AttnState));
+    for (int L = 0; L < M->n_layers; L++)
+        dsv4_state_init_full(&R->st[L], 1, M->cfg[L].attn.hd, M->cfg[L].attn.win,
+                             M->max_seq, M->cfg[L].attn.ratio, M->cfg[L].attn.i_hd);
+    R->h      = malloc((size_t)M->hc * M->dim * sizeof(float));
+    R->h2     = malloc((size_t)M->hc * M->dim * sizeof(float));
+    R->emb    = malloc((size_t)M->dim * sizeof(float));
+    R->logits = malloc((size_t)M->vocab * sizeof(float));
+}
+
+/* Entre peticiones hay que tirar TODO el estado de atención, no sólo el anillo
+ * KV: cada capa comprimida arrastra el bloque en curso del compresor y, si es
+ * ratio 4, el del indexer. Reaprovechar uno a medias mezcla dos conversaciones
+ * de una forma que no da error, sólo texto raro. */
+static void run_reset(Run *R) {
+    Model *M = R->M;
+    for (int L = 0; L < M->n_layers; L++) {
+        dsv4_state_free(&R->st[L]);
+        dsv4_state_init_full(&R->st[L], 1, M->cfg[L].attn.hd, M->cfg[L].attn.win,
+                             M->max_seq, M->cfg[L].attn.ratio, M->cfg[L].attn.i_hd);
+    }
+    R->pos = 0;
+}
+
+/* Un token adentro, los logits afuera. */
+static const float *run_step(Run *R, int tokid) {
+    Model *M = R->M;
+    const int dim = M->dim, hc = M->hc;
+    {
+        const DsV4W row = dsv4_w_rows(&M->embed, tokid, 1);
+        const uint16_t *p = (const uint16_t *)row.w;
+        for (int d = 0; d < dim; d++) R->emb[d] = dsv4_bf16_to_f32(p[d]);
+        for (int m = 0; m < hc; m++)
+            memcpy(R->h + (size_t)m * dim, R->emb, (size_t)dim * sizeof(float));
+    }
+    for (int L = 0; L < M->n_layers; L++) {
+        model_layer_decode(M, L, &R->st[L], R->h, R->pos, (int32_t)tokid, R->h2);
+        memcpy(R->h, R->h2, (size_t)hc * dim * sizeof(float));
+    }
+    R->pos++;
+
+    float y[8192], nz[8192];
+    dsv4_hc_head(R->h, M->hc_head_fn, M->hc_head_scale, M->hc_head_base,
+                 hc, dim, M->norm_eps, M->hc_eps, y);
+    dsv4_rmsnorm(nz, y, M->final_norm, dim, M->norm_eps);
+    for (int d = 0; d < dim; d++) nz[d] = dsv4_to_bf16(nz[d]);
+    const double t = now_s();
+    dsv4_matmul_w(R->logits, nz, &M->head, 1, 0);
+    g_t_head += now_s() - t;
+    return R->logits;
+}
+
+/* ---------------------------------------------------------------------------
+ * Muestreo. El CLI usa argmax; la pasarela manda temperatura y top_p por
+ * petición, así que hace falta el nucleus de verdad.
+ * ------------------------------------------------------------------------- */
+static uint64_t g_rng = 0x853c49e6748fea9bULL;
+static double rnd01(void) {
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+    return (double)(g_rng >> 11) / 9007199254740992.0;
+}
+
+static const float *g_sort_logits;
+static int cmp_by_logit(const void *a, const void *b) {
+    const float x = g_sort_logits[*(const int *)a];
+    const float y = g_sort_logits[*(const int *)b];
+    return (x < y) - (x > y);          /* descendente */
+}
+
+static int sample_tok(const float *logits, int n, float temp, float top_p) {
+    if (temp <= 0.0f) {
+        int best = 0;
+        for (int v = 1; v < n; v++) if (logits[v] > logits[best]) best = v;
+        return best;
+    }
+    static int *idx = NULL;
+    static float *pr = NULL;
+    if (!idx) { idx = malloc((size_t)n * sizeof(int)); pr = malloc((size_t)n * sizeof(float)); }
+    for (int v = 0; v < n; v++) idx[v] = v;
+    g_sort_logits = logits;
+    qsort(idx, (size_t)n, sizeof(int), cmp_by_logit);
+
+    const float top = logits[idx[0]];
+    double sum = 0.0;
+    for (int v = 0; v < n; v++) {
+        pr[v] = expf((logits[idx[v]] - top) / temp);
+        sum += pr[v];
+    }
+    /* nucleus: se corta cuando la masa acumulada llega a top_p */
+    const double cut = (top_p > 0.0f && top_p < 1.0f) ? top_p * sum : sum;
+    double acc = 0.0;
+    int last = n - 1;
+    for (int v = 0; v < n; v++) { acc += pr[v]; if (acc >= cut) { last = v; break; } }
+
+    const double r = rnd01() * acc;
+    double c = 0.0;
+    for (int v = 0; v <= last; v++) { c += pr[v]; if (c >= r) return idx[v]; }
+    return idx[last];
+}
+
+/* ---------------------------------------------------------------------------
+ * Modo serve: el protocolo mux que habla `openai_server.py`.
+ *
+ * Mismo formato de línea que `colibri.c` e `inkling.c` —byte a byte, para que
+ * la pasarela sea la misma— con una simplificación: un solo slot de KV. El mux
+ * admite hasta 16 y reaprovecha el prefijo común de cada conversación; aquí
+ * cada petición reinicia el estado. Es correcto, sólo más lento en turnos
+ * largos, y evita replicar los estados de compresor e indexer por slot.
+ * ------------------------------------------------------------------------- */
+static double rss_gb(void) {
+    struct rusage r;
+    getrusage(RUSAGE_SELF, &r);
+    return (double)r.ru_maxrss / 1e6;
+}
+
+typedef struct {
+    char id[64];
+    int max_tok;
+    float temp, top_p;
+    char *payload;
+    int plen;
+} ServeReq;
+
+/* -1 EOF, 0 nada util, 1 cancelar la peticion activa, 2 nueva peticion */
+static int serve_read_req(ServeReq *q, const char *active) {
+    char line[512], cmd[16], id[64];
+    if (!fgets(line, sizeof line, stdin)) return -1;
+    if (sscanf(line, "%15s %63s", cmd, id) < 2) return 0;
+    if (!strcmp(cmd, "CANCEL") || !strcmp(cmd, "STOP"))
+        return active && !strcmp(active, id);
+    if (strcmp(cmd, "SUBMIT")) return 0;
+
+    int slot, plen, max_tok; float temp, top_p;
+    if (sscanf(line, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p) != 5
+        || plen < 0 || plen > (1 << 24) || max_tok < 1) {
+        printf("ERROR %s BAD_FRAME\n", id); fflush(stdout); return 0;
+    }
+    (void)slot;                        /* un solo slot: ver la nota de arriba */
+    char *payload = malloc((size_t)plen + 1);
+    if (!payload) { printf("ERROR %s BAD_REQUEST\n", id); fflush(stdout); return 0; }
+    if (fread(payload, 1, (size_t)plen, stdin) != (size_t)plen) { free(payload); return -1; }
+    (void)fgetc(stdin);                /* el \n que cierra el frame */
+    payload[plen] = 0;
+    snprintf(q->id, sizeof q->id, "%s", id);
+    q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
+    q->payload = payload; q->plen = plen;
+    return 2;
+}
+
+static void serve_data(const char *id, const char *p, int n) {
+    if (n <= 0) return;
+    printf("DATA %s %d\n", id, n);
+    fwrite(p, 1, (size_t)n, stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
+static void serve_one(Run *R, ServeReq *q) {
+    Model *M = R->M;
+    const int cap = 65536;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int np = 0;
+    ids[np++] = M->bos;                              /* el modelo lo espera */
+    np += tok_encode(&M->tok, q->payload, q->plen, ids + np, cap - np);
+    if (np <= 1) {
+        printf("ERROR %s EMPTY_PROMPT\n", q->id); fflush(stdout); free(ids); return;
+    }
+
+    run_reset(R);
+    const uint64_t hit0 = M->tier.hits, miss0 = M->tier.miss;
+    const double t0 = now_s();
+
+    int gen = 0, limited = 1, cancelled = 0;
+    int tokid = ids[0];
+    double tdec = 0.0;
+    for (int step = 0; ; step++) {
+        const float *lo = run_step(R, tokid);
+        if (step + 1 < np) { tokid = ids[step + 1]; continue; }   /* aún prefill */
+        if (gen == 0) tdec = now_s();
+
+        const int nx = sample_tok(lo, M->vocab, q->temp, q->top_p);
+        /* 128805 = <|EOT|>: el formato de chat de DeepSeek lo usa además del
+         * end-of-sentence del config. Parar sólo en el segundo deja el turno
+         * corriendo hasta agotar max_tokens. */
+        if (nx == M->eos || nx == 128805) { limited = 0; break; }
+
+        char piece[64];
+        const int m = tok_decode(&M->tok, &nx, 1, piece, sizeof piece - 1);
+        serve_data(q->id, piece, m);
+        gen++;
+        tokid = nx;
+
+        /* La pasarela puede cancelar mientras generamos. */
+        while (coli_stdin_readable()) {
+            ServeReq extra = { 0 };
+            const int r = serve_read_req(&extra, q->id);
+            if (r < 0) { cancelled = 1; break; }
+            if (r == 1) cancelled = 1;
+            if (r == 2) {                            /* un solo slot */
+                printf("ERROR %s SLOT_BUSY\n", extra.id); fflush(stdout);
+                free(extra.payload);
+            }
+        }
+        if (cancelled) { limited = 0; break; }
+        if (gen >= q->max_tok) break;
+    }
+
+    const double decode = now_s() - (tdec > 0 ? tdec : t0);
+    const uint64_t hits = M->tier.hits - hit0, miss = M->tier.miss - miss0;
+    const uint64_t tot = hits + miss;
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
+           decode > 0 ? gen / decode : 0.0,
+           tot ? 100.0 * (double)hits / (double)tot : 0.0,
+           rss_gb(), np, limited);
+    fflush(stdout);
+    free(ids);
+}
+
+static void serve_loop(Run *R) {
+    setvbuf(stdin, NULL, _IONBF, 0);
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+    for (;;) {
+        ServeReq q = { 0 };
+        int r;
+        do r = serve_read_req(&q, NULL); while (r == 0);
+        if (r < 0) return;                       /* EOF: apagado ordenado */
+        if (r == 2) { serve_one(R, &q); free(q.payload); }
+    }
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* La pasarela lanza el motor con SNAP=<dir>, SERVE=1 y NGEN=<max_tokens>,
+     * y le pasa el `cap` de la caché como argv[1]. */
+    const char *sv = getenv("SERVE");
+    if (sv && sv[0] == '1') {
+#ifdef _WIN32
+        /* Sin esto, la traduccion CRLF del CRT corrompe los centinelas y deja
+         * colgadas las lecturas por bytes contados (colibri #195). */
+        _setmode(_fileno(stdin),  _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
+#endif
+        const char *snap = getenv("SNAP");
+        if (!snap || !*snap) { fprintf(stderr, "SERVE=1 necesita SNAP=<dir>\n"); return 1; }
+        /* MinGW no trae setenv, así que el cap viaja por variable global. */
+        if (argc > 1 && atoi(argv[1]) > 0) g_cache_per_layer = atoi(argv[1]);
+        Model M;
+        model_load(&M, snap);
+        char tp[1024];
+        snprintf(tp, sizeof tp, "%s/tokenizer.json", snap);
+        tok_load(&M.tok, tp);
+        Run R;
+        run_init(&R, &M);
+        serve_loop(&R);
+        return 0;
+    }
+
     const char *dir = (argc > 1) ? argv[1]
         : "C:\\Users\\Gus\\ai\\models\\DeepSeek-V4-Flash-0731";
     const char *prompt = (argc > 2) ? argv[2] : "hola";
