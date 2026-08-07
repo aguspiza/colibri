@@ -10,9 +10,9 @@ expertos: streaming con cache de 512 slots de 11008 totales
 
 La capital de Francia es una de las ciudades más visitadas del mundo
 
-14 tokens en 33.5 s (0.42 tok/s)
-perfil (total): atencion 8.0 s | MoE 24.7 s | head 0.3 s | resto 0.5 s
-  del MoE, 19.5 s son I/O de expertos y 5.2 s computo
+14 tokens en 27.5 s (0.51 tok/s)
+perfil (total): atencion 9.0 s | MoE 17.6 s | head 0.3 s | resto 0.5 s
+  del MoE, 12.3 s son I/O de expertos y 5.4 s computo
 expertos: 1765 hits / 1847 miss (49% acierto), 24.69 GB leidos
 ```
 
@@ -40,36 +40,61 @@ Vectorizar (AVX2+FMA) y repartir las filas de salida entre los 8 núcleos da
 **2,6× en total**. Los errores contra la referencia no se mueven ni un dígito
 (FP8 4,82e-07, MoE 1,67e-03): el orden de acumulación cambia, la precisión no.
 
-## Ahora manda el disco
+## Un handle por hilo, o el disco va a un tercio
 
-Con el cómputo arreglado, el I/O es el 58 % del tiempo. Se leen 20 GB por cada
-14 tokens a **1,28 GB/s**, y ese número ya es el techo: el prefetch lanza las
-lecturas del `top-6` en paralelo sobre 16 hilos —`compat_pread` es
-`ReadFile`+`OVERLAPPED` sobre el handle crudo, así que es seguro— y no sube. Es
-un NVMe sin DRAM a su ritmo sostenido.
+Con el cómputo arreglado el I/O pasó a ser el 58 % del tiempo: 20 GB por cada 14
+tokens a **1,28 GB/s**. Di por hecho que era el techo del NVMe —el prefetch ya
+lanzaba las lecturas del `top-k` sobre 16 hilos— y me equivoqué. Medido en frío
+y con conjuntos disjuntos, replicando el patrón real de acceso:
 
-Si no se puede leer más rápido, hay que leer menos. La caché LRU tiene poco
-recorrido: en esa generación se piden **1.529 expertos-capa distintos** frente a
-1.847 fallos, así que una caché infinita sólo ahorraría el 17 % restante.
-
-Lo que sí lo cambia es **procesar varios tokens a la vez**, porque comparten
-expertos. Medido sobre la traza de ruteo real del checkpoint:
-
-| lote | expertos-capa en la unión | lecturas/token | reducción |
+| | 1 hilo | 4 hilos | 8+ |
 |---|---|---|---|
-| 1 | 258 | 258 | 1,00x |
-| 2 | 404 | 202 | 1,28x |
-| **5** | **724** | **145** | **1,78x** |
-| 8 | 995 | 124 | 2,07x |
+| lecturas dispersas de 4 MB | 1,06 GB/s | 2,73 GB/s | ~2,9 GB/s |
 
-`dsv4_moe.h` ya lo aprovecha: recorre la **unión** de expertos del lote y aplica
-cada uno a todas las filas que lo eligieron, en vez de iterar fila a fila
-releyendo. En el test de streaming eso baja las lecturas de 132,51 MB a 22,02 MB
-con los logits **bit a bit idénticos**. Con `rows==1` el orden de acumulación es
-el de antes, así que el decode no cambia.
+El motor sacaba 1,28: **el ritmo de un solo lector**. La causa es que
+`compat_pread` hace `ReadFile`+`OVERLAPPED` sobre un handle abierto en modo
+síncrono, y en Windows el SO serializa la E/S sobre el objeto fichero aunque le
+pases un `OVERLAPPED`. El paralelismo era aparente.
 
-Y 5 es justo `dspark_block_size` del `config.json`, que es lo que hace que la
-pila MTP sea la siguiente pieza y no un adorno — ver abajo.
+La solución es **un descriptor por hilo y shard** (48 x 16 handles, abiertos al
+cargar). Con eso el I/O baja de 20,6 a 12,3 s y el ancho de banda sube a 1,98
+GB/s. De paso, los offsets de los 66.048 tensores de experto se resuelven una
+vez al cargar, y los buffers de cada slot se reservan una sola vez: el
+`realloc` estaba en la parte serie de cada tanda.
+
+**Cuidado al medir esto.** Los dos primeros intentos dieron 7,6 y 4,0 GB/s
+porque las pasadas releían los mismos tensores desde la caché de páginas del SO
+— estaban midiendo RAM. `posix_fadvise(DONTNEED)` no basta en Windows; hace
+falta que cada medida toque bytes que nadie ha leído antes.
+
+## Lo que NO funcionó: procesar varios tokens a la vez
+
+Parecía la siguiente palanca obvia, y la medida decía que no.
+
+Los tokens consecutivos comparten expertos, así que un lote de 5 pide 724
+expertos-capa distintos en vez de 5x258=1290 — 1,78x menos *peticiones*. Pero
+ésa es la comparación equivocada: el baseline real no son 258 peticiones por
+token sino **124,2 fallos de caché**, porque la LRU ya estaba explotando ese
+mismo solapamiento. Simulando la política de caché sobre la traza de ruteo real
+(el simulador reproduce **exactamente** los 2.980 fallos que mide el motor):
+
+| lote | fallos/token | vs secuencial |
+|---|---|---|
+| 1 (hoy) | **124,2** | — |
+| 2 | 138,5 | 0,90x |
+| 5 | 162,2 | 0,77x |
+| 8 | 138,1 | 0,90x |
+
+Agrupar **empeora**. En orden secuencial cada capa se revisita cada 258 accesos
+y con 512 slots eso cabe; en lotes de 5 se revisita cada 724 y no cabe, así que
+la agrupación convierte aciertos de caché en deduplicación y encima pierde. Con
+una caché que sostuviera el conjunto de trabajo del lote (~9,7 GB) se daría la
+vuelta, pero no cabe en esta máquina.
+
+`dsv4_moe.h` implementa igualmente el recorrido por **unión** de expertos —cada
+uno se aplica a todas las filas que lo eligieron— porque es correcto y hace
+falta para cualquier camino por lotes. Con `rows==1` el orden de acumulación es
+el de antes y el decode da los mismos bits.
 
 > **Sigue siendo trabajo en curso.** El forward está entero y validado pieza a
 > pieza contra la implementación de referencia de DeepSeek, pero falta la pila
@@ -203,14 +228,30 @@ con su struct `QT`.
   dspark_markov_rank: 256       dspark_noise_token_id: 128799
   ```
 
-  Verifica 5 tokens por pasada, y por la tabla de arriba eso es 1,78x menos I/O
-  por token — que es donde se va el 58 % del tiempo. **Cabe en memoria**: de sus
-  10,12 GiB en disco sólo **0,55 GiB son densos** (atención, `shared_experts`,
-  `gate`, las `hc_*` y las dos cabezas); los otros 9,56 GiB son expertos y van
-  por streaming como los demás. El residente pasaría de 8,67 a 9,22 GiB.
-  Estructuralmente cada bloque es un bloque normal —atención + MoE de 256
-  expertos + compartido— así que reutiliza las primitivas ya validadas; lo nuevo
-  son `markov_head`, `confidence_head` y el bucle de aceptación.
+  **Cabe en memoria**: de sus 10,12 GiB en disco sólo **0,55 GiB son densos**
+  (atención, `shared_experts`, `gate`, las `hc_*` y las dos cabezas); los otros
+  9,56 GiB son expertos y van por streaming. El residente pasaría de 8,67 a
+  9,22 GiB. Cada bloque es un bloque normal —atención + MoE de 256 expertos +
+  compartido— así que reutiliza las primitivas ya validadas; lo nuevo son
+  `markov_head`, `confidence_head` y el bucle de aceptación.
+
+  Con decode greedy la aceptación es **exacta y trivial**: se acepta el prefijo
+  más largo cuyos tokens borrador coincidan con el argmax del modelo principal,
+  sin muestreo por rechazo ni umbral de confianza. Y el criterio de validación
+  es inmejorable: el texto tiene que salir idéntico.
+
+  Pero **en esta máquina no compensa**, por la tabla de lotes de arriba: el
+  ahorro de I/O es negativo con una caché de 512 slots, y el borrador cuesta 3
+  capas más de expertos por ciclo. Es una conclusión de esta configuración, no
+  del método: con RAM para una caché de ~10 GB se daría la vuelta.
+
+  Dos trampas para quien lo implemente: **son 3 bloques, no 1** — el
+  `num_nextn_predict_layers: 1` del `config.json` no corresponde con el
+  `n_mtp_layers` de `model.py`, y hay que derivarlo del checkpoint (`mtp.0`
+  tiene `main_proj`/`main_norm`, `mtp.2` tiene `norm`/`markov_head`/
+  `confidence_head`/`hc_head_*`, `mtp.1` ninguno). Y **DeepSeek no publica el
+  bucle de aceptación**: `generate.py` es decode autoregresivo normal, así que
+  del repo de referencia sale el borrador pero no la verificación.
 - **Streaming real**: enganchar el pool de hilos, `experts_apply_union`, PILOT,
   `.coli_usage`, `O_DIRECT` y dual-SSD. Es infraestructura ya existente y
   agnóstica al modelo. Demostrado sobre un modelo reducido que la semántica no

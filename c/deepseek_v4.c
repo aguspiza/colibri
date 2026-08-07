@@ -55,7 +55,7 @@ static double now_s(void) {
 
 /* Perfil: dónde se va el tiempo. Antes de optimizar, medir. */
 static double g_t_attn, g_t_moe, g_t_io, g_t_head;
-static uint64_t g_pf_bytes, g_pf_batches, g_pf_reads, g_fb_bytes;
+static uint64_t g_pf_batches, g_pf_reads, g_fb_bytes;
 static int g_pf_threads;
 static uint8_t g_seen[(43 * 256 + 7) / 8];   /* capas x expertos, 1 bit cada uno */
 static uint64_t g_distinct;
@@ -76,14 +76,29 @@ typedef struct {
     uint64_t used;
 } ExpSlot;
 
+/* Un tensor de experto, ya resuelto: sin buscar por nombre en el camino
+ * caliente. */
+typedef struct { int shard; int64_t off, nb; } ExpTensor;
+
 typedef struct {
     shards *S;
     int n_layers, n_experts, cap, inter, dim;
-    char (*names)[6][96];   /* [layer*n_experts] -> los 6 nombres de tensor */
+    ExpTensor *tens;        /* [(layer*n_experts + e)*6 + k] */
     ExpSlot *slots;
     int nslot;
     uint64_t clock, hits, miss;
     uint64_t bytes;
+
+    /* UN DESCRIPTOR POR HILO Y SHARD.
+     *
+     * En Windows, las ReadFile concurrentes sobre un handle abierto en modo
+     * síncrono las serializa el propio SO sobre el objeto fichero, aunque se
+     * les pase un OVERLAPPED. Medido en este equipo: lecturas dispersas en frío
+     * dan 1,06 GB/s con un hilo y 2,9 GB/s con cuatro *si cada uno tiene su
+     * propio descriptor* — compartiéndolo se quedan en el ritmo de uno solo.
+     * Era el motivo de que paralelizar el prefetch no cambiase nada. */
+    int nthreads, nshard;
+    int *fd;                /* [thread * nshard + shard] */
 } ExpertTier;
 
 static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
@@ -94,16 +109,39 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
     T->inter = inter; T->dim = dim; T->cap = cap;
     T->slots = calloc((size_t)cap, sizeof(ExpSlot));
     for (int i = 0; i < cap; i++) { T->slots[i].layer = -1; T->slots[i].expert = -1; }
-    T->names = malloc((size_t)n_layers * n_experts * sizeof(*T->names));
+
+    /* Resuelve los 66.048 tensores de una vez: en decode no se busca por
+     * nombre, se hace pread a un offset ya conocido. */
+    T->tens = malloc((size_t)n_layers * n_experts * 6 * sizeof(ExpTensor));
     static const char *mats[3] = { "w1", "w2", "w3" };
     for (int l = 0; l < n_layers; l++)
-        for (int e = 0; e < n_experts; e++) {
-            char (*row)[96] = T->names[(size_t)l * n_experts + e];
-            for (int k = 0; k < 3; k++) {
-                snprintf(row[k * 2],     96, "layers.%d.ffn.experts.%d.%s.weight", l, e, mats[k]);
-                snprintf(row[k * 2 + 1], 96, "layers.%d.ffn.experts.%d.%s.scale",  l, e, mats[k]);
-            }
-        }
+        for (int e = 0; e < n_experts; e++)
+            for (int k = 0; k < 3; k++)
+                for (int which = 0; which < 2; which++) {
+                    char nm[96];
+                    snprintf(nm, sizeof nm, "layers.%d.ffn.experts.%d.%s.%s",
+                             l, e, mats[k], which ? "scale" : "weight");
+                    st_tensor *t = st_find(S, nm);
+                    if (!t) { fprintf(stderr, "falta %s\n", nm); exit(1); }
+                    ExpTensor *d = &T->tens[((size_t)l * n_experts + e) * 6 + k * 2 + which];
+                    d->off = t->off; d->nb = t->nbytes; d->shard = -1;
+                    for (int i = 0; i < S->nfd; i++)
+                        if (S->fds[i] == t->fd) { d->shard = i; break; }
+                    if (d->shard < 0) { fprintf(stderr, "shard de %s?\n", nm); exit(1); }
+                }
+
+    /* Un descriptor por hilo y shard: ver el comentario de la struct. */
+#ifdef _OPENMP
+    T->nthreads = omp_get_max_threads();
+#else
+    T->nthreads = 1;
+#endif
+    T->nshard = S->nfd;
+    T->fd = malloc((size_t)T->nthreads * T->nshard * sizeof(int));
+    for (int t = 0; t < T->nthreads; t++)
+        for (int i = 0; i < T->nshard; i++)
+            T->fd[t * T->nshard + i] =
+                (t == 0) ? S->fds[i] : open(S->paths[i], COMPAT_O_RDONLY);
 }
 
 /* Busca el experto en la caché; -1 si no está. */
@@ -129,26 +167,34 @@ static int tier_reserve(ExpertTier *T)
     return v;
 }
 
-/* Lee los 6 tensores de un experto en su slot. Sin estado compartido salvo el
- * contador de bytes, así que es seguro llamarla desde varios hilos sobre slots
- * distintos: `compat_pread` es ReadFile+OVERLAPPED sobre el handle crudo,
- * precisamente para no depender del puntero de fichero. */
-static void tier_fill(ExpertTier *T, int slot, int layer, int e)
+/* Reserva los buffers de los 6 tensores de un experto y anota los bytes. No
+ * lee: la lectura se reparte aparte, ver `tier_prefetch`. */
+/* Todos los expertos tienen la misma forma, así que los buffers se reservan una
+ * vez por slot y no se vuelven a tocar: el `realloc` estaba en la parte SERIE
+ * de cada tanda de prefetch, 19 veces por capa y por token. */
+static void tier_alloc(ExpertTier *T, int slot, int layer, int e)
 {
     ExpSlot *s = &T->slots[slot];
-    char (*row)[96] = T->names[(size_t)layer * T->n_experts + e];
-    uint64_t nread = 0;
+    const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6];
     for (int k = 0; k < 6; k++) {
-        const int64_t nb = st_nbytes(T->S, row[k]);
-        s->buf[k] = realloc(s->buf[k], (size_t)nb);
-        st_read_raw(T->S, row[k], s->buf[k], 0);
-        nread += (uint64_t)nb;
+        if (!s->buf[k]) s->buf[k] = malloc((size_t)d[k].nb);
+        T->bytes += (uint64_t)d[k].nb;
     }
     s->layer = layer; s->expert = e;
-#ifdef _OPENMP
-#   pragma omp atomic
-#endif
-    T->bytes += nread;
+}
+
+/* Lee un tensor suelto por el descriptor DEL HILO que llama. */
+static void tier_read_one(ExpertTier *T, int slot, int layer, int e, int k, int tid)
+{
+    const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6 + k];
+    const int fd = T->fd[(size_t)tid * T->nshard + d->shard];
+    uint8_t *out = T->slots[slot].buf[k];
+    int64_t done = 0;
+    while (done < d->nb) {
+        const ssize_t got = pread(fd, out + done, (size_t)(d->nb - done), d->off + done);
+        if (got <= 0) { fprintf(stderr, "pread corto en capa %d experto %d\n", layer, e); exit(1); }
+        done += got;
+    }
 }
 
 /* Trae de golpe los `n` expertos que el router acaba de elegir.
@@ -187,14 +233,24 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
 
     const double t0 = now_s();
     g_pf_batches++; g_pf_reads += (uint64_t)nw;
+    for (int j = 0; j < nw; j++) tier_alloc(T, slot[j], layer, want[j]);
+
+    /* Se reparte por TENSOR, no por experto. Repartiendo por experto cada hilo
+     * hacía sus 6 lecturas en serie, así que con ~3,2 expertos por tanda la
+     * profundidad de cola efectiva era 3,2 y no 19 — y un NVMe da su ancho de
+     * banda con la cola llena. Los 6*nw trabajos son independientes. */
+    const int njob = nw * 6;
 #ifdef _OPENMP
-#   pragma omp parallel for schedule(dynamic, 1) if (nw > 1)
+#   pragma omp parallel for schedule(dynamic, 1) if (njob > 1)
 #endif
-    for (int j = 0; j < nw; j++) {
+    for (int j = 0; j < njob; j++) {
 #ifdef _OPENMP
+        const int tid = omp_get_thread_num();
         if (j == 0) g_pf_threads = omp_get_num_threads();
+#else
+        const int tid = 0;
 #endif
-        tier_fill(T, slot[j], layer, want[j]);
+        tier_read_one(T, slot[j / 6], layer, want[j / 6], j % 6, tid);
     }
     g_t_io += now_s() - t0;
 }
@@ -209,7 +265,8 @@ static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4
         hit = tier_reserve(T);
         const double t0 = now_s();
         const uint64_t b0 = T->bytes;
-        tier_fill(T, hit, layer, e);
+        tier_alloc(T, hit, layer, e);
+        for (int k = 0; k < 6; k++) tier_read_one(T, hit, layer, e, k, 0);
         g_fb_bytes += T->bytes - b0;
         g_t_io += now_s() - t0;
     }
