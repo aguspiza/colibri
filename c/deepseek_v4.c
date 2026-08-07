@@ -811,6 +811,11 @@ typedef struct {
     DsV4AttnState *st;
     float *h, *h2, *logits, *emb;
     int pos;
+    /* Los ids YA metidos por `run_step`, en orden. Es el historial contra el
+     * que se compara el prompt siguiente para reaprovechar el prefijo comun.
+     * Se anota dentro de run_step, asi que no puede desincronizarse del
+     * estado por mucho que cambie el bucle de arriba. */
+    int *hist, nhist, hcap;
 } Run;
 
 static void run_init(Run *R, Model *M) {
@@ -824,6 +829,8 @@ static void run_init(Run *R, Model *M) {
     R->h2     = malloc((size_t)M->hc * M->dim * sizeof(float));
     R->emb    = malloc((size_t)M->dim * sizeof(float));
     R->logits = malloc((size_t)M->vocab * sizeof(float));
+    R->hcap = 65536;
+    R->hist = malloc((size_t)R->hcap * sizeof(int));
 }
 
 /* Entre peticiones hay que tirar TODO el estado de atención, no sólo el anillo
@@ -838,6 +845,7 @@ static void run_reset(Run *R) {
                              M->max_seq, M->cfg[L].attn.ratio, M->cfg[L].attn.i_hd);
     }
     R->pos = 0;
+    R->nhist = 0;
 }
 
 /* Un token adentro, los logits afuera. */
@@ -856,6 +864,7 @@ static const float *run_step(Run *R, int tokid) {
         memcpy(R->h, R->h2, (size_t)hc * dim * sizeof(float));
     }
     R->pos++;
+    if (R->hist && R->nhist < R->hcap) R->hist[R->nhist++] = tokid;
 
     float y[8192], nz[8192];
     dsv4_hc_head(R->h, M->hc_head_fn, M->hc_head_scale, M->hc_head_base,
@@ -984,14 +993,31 @@ static void serve_one(Run *R, ServeReq *q) {
         printf("ERROR %s EMPTY_PROMPT\n", q->id); fflush(stdout); free(ids); return;
     }
 
-    run_reset(R);
+    /* REAPROVECHAR EL PREFIJO (el "truncate-and-extend" del protocolo).
+     *
+     * En una conversación, el prompt de un turno es el anterior más la
+     * respuesta del modelo más el mensaje nuevo: una EXTENSIÓN pura de lo que
+     * ya se metió. Comparando con el historial se saltan todas esas capas y
+     * sólo se procesa la cola nueva. Sin esto, el tercer turno de una charla de
+     * 300 tokens cuesta ~420 s antes de escribir la primera palabra.
+     *
+     * Cuando el prompt DIVERGE (el cliente edita el historial, o llega otra
+     * conversación) haría falta retroceder el estado, y eso aquí no se puede:
+     * el anillo KV sí, pero los compresores y el indexer acumulan el bloque en
+     * curso y no se pueden "desacumular". En ese caso se reinicia entero, que
+     * es correcto y sólo más lento. */
+    int reuse = 0;
+    while (reuse < R->nhist && reuse < np && R->hist[reuse] == ids[reuse]) reuse++;
+    if (reuse < R->nhist || reuse >= np) { run_reset(R); reuse = 0; }
+    if (reuse) fprintf(stderr, "[serve] prefijo reaprovechado: %d de %d tokens\n", reuse, np);
+
     const uint64_t hit0 = M->tier.hits, miss0 = M->tier.miss;
     const double t0 = now_s();
 
     int gen = 0, limited = 1, cancelled = 0;
-    int tokid = ids[0];
+    int tokid = ids[reuse];
     double tdec = 0.0;
-    for (int step = 0; ; step++) {
+    for (int step = reuse; ; step++) {
         const float *lo = run_step(R, tokid);
         if (step + 1 < np) { tokid = ids[step + 1]; continue; }   /* aún prefill */
         if (gen == 0) tdec = now_s();
