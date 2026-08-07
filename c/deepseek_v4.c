@@ -29,6 +29,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include <pthread.h>
 
 #include "compat.h"
 #include "json.h"
@@ -56,7 +57,6 @@ static double now_s(void) {
 /* Perfil: dónde se va el tiempo. Antes de optimizar, medir. */
 static double g_t_attn, g_t_moe, g_t_io, g_t_head;
 static uint64_t g_pf_batches, g_pf_reads, g_fb_bytes;
-static int g_pf_threads;
 static uint8_t g_seen[(43 * 256 + 7) / 8];   /* capas x expertos, 1 bit cada uno */
 static uint64_t g_distinct;
 static FILE *g_trace;   /* DSV4_TRACE=fichero -> vuelca (token,capa,experto) */
@@ -74,7 +74,11 @@ typedef struct {
     uint8_t *buf[6];        /* w1,w1s, w2,w2s, w3,w3s */
     int layer, expert;
     uint64_t used;
+    int pending;            /* lecturas en vuelo; 0 = listo para usar */
 } ExpSlot;
+
+/* Un trabajo de lectura: un tensor de un experto en un slot. */
+typedef struct { int slot, layer, expert, k; } RdJob;
 
 /* Un tensor de experto, ya resuelto: sin buscar por nombre en el camino
  * caliente. */
@@ -99,7 +103,23 @@ typedef struct {
      * Era el motivo de que paralelizar el prefetch no cambiase nada. */
     int nthreads, nshard;
     int *fd;                /* [thread * nshard + shard] */
+
+    /* POOL PERSISTENTE DE LECTORES.
+     *
+     * `tier_prefetch` encola y vuelve; el MoE se pone a calcular el primer
+     * experto mientras los demás siguen llegando. Antes bloqueaba hasta tener
+     * los seis, así que los 4,3 s de cómputo y los 12,2 de I/O iban en serie.
+     * También quita el montaje y desmontaje de una región OpenMP por capa y
+     * token, que eran 602 en una generación de 14. */
+    RdJob *q;
+    int qcap, qhead, qtail;
+    pthread_mutex_t mu;
+    pthread_cond_t cv_job, cv_done;
+    pthread_t *th;
+    int stop;
 } ExpertTier;
+
+static void tier_pool_start(ExpertTier *T);
 
 static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
                       int inter, int dim, int cap)
@@ -142,6 +162,8 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
         for (int i = 0; i < T->nshard; i++)
             T->fd[t * T->nshard + i] =
                 (t == 0) ? S->fds[i] : open(S->paths[i], COMPAT_O_RDONLY);
+
+    tier_pool_start(T);
 }
 
 /* Busca el experto en la caché; -1 si no está. */
@@ -159,9 +181,15 @@ static int tier_reserve(ExpertTier *T)
     int v;
     if (T->nslot < T->cap) v = T->nslot++;
     else {
-        v = 0;
-        for (int i = 1; i < T->nslot; i++)
-            if (T->slots[i].used < T->slots[v].used) v = i;
+        /* Un slot con lecturas EN VUELO no se puede expulsar: los workers están
+         * escribiendo en sus buffers. Como mucho hay `topk` a la vez y la caché
+         * tiene cientos, así que saltárselos nunca deja al LRU sin candidato. */
+        v = -1;
+        for (int i = 0; i < T->nslot; i++) {
+            if (T->slots[i].pending) continue;
+            if (v < 0 || T->slots[i].used < T->slots[v].used) v = i;
+        }
+        if (v < 0) { fprintf(stderr, "cache demasiado pequena: todo en vuelo\n"); exit(1); }
     }
     T->slots[v].used = ++T->clock;
     return v;
@@ -183,7 +211,10 @@ static void tier_alloc(ExpertTier *T, int slot, int layer, int e)
     s->layer = layer; s->expert = e;
 }
 
-/* Lee un tensor suelto por el descriptor DEL HILO que llama. */
+/* Lee un tensor suelto por el descriptor DEL HILO que llama.
+ *
+ * Sin estado compartido: cada hilo usa su propio fd y escribe en un buffer
+ * distinto. Sólo `pending` se toca bajo el mutex, en el bucle del worker. */
 static void tier_read_one(ExpertTier *T, int slot, int layer, int e, int k, int tid)
 {
     const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6 + k];
@@ -195,6 +226,69 @@ static void tier_read_one(ExpertTier *T, int slot, int layer, int e, int k, int 
         if (got <= 0) { fprintf(stderr, "pread corto en capa %d experto %d\n", layer, e); exit(1); }
         done += got;
     }
+}
+
+/* Un worker: saca trabajos de la cola hasta que le dicen que pare. Su índice
+ * es también el índice de su juego de descriptores. */
+typedef struct { ExpertTier *T; int tid; } RdArg;
+
+static void *tier_worker(void *arg)
+{
+    RdArg *a = (RdArg *)arg;
+    ExpertTier *T = a->T;
+    const int tid = a->tid;
+    for (;;) {
+        pthread_mutex_lock(&T->mu);
+        while (T->qhead == T->qtail && !T->stop)
+            pthread_cond_wait(&T->cv_job, &T->mu);
+        if (T->stop && T->qhead == T->qtail) { pthread_mutex_unlock(&T->mu); break; }
+        const RdJob j = T->q[T->qhead];
+        T->qhead = (T->qhead + 1) % T->qcap;
+        pthread_mutex_unlock(&T->mu);
+
+        tier_read_one(T, j.slot, j.layer, j.expert, j.k, tid);
+
+        pthread_mutex_lock(&T->mu);
+        if (--T->slots[j.slot].pending == 0) pthread_cond_broadcast(&T->cv_done);
+        pthread_mutex_unlock(&T->mu);
+    }
+    return NULL;
+}
+
+static void tier_pool_start(ExpertTier *T)
+{
+    T->qcap = 4096;
+    T->q = malloc((size_t)T->qcap * sizeof(RdJob));
+    pthread_mutex_init(&T->mu, NULL);
+    pthread_cond_init(&T->cv_job, NULL);
+    pthread_cond_init(&T->cv_done, NULL);
+    T->th = malloc((size_t)T->nthreads * sizeof(pthread_t));
+    for (int i = 0; i < T->nthreads; i++) {
+        RdArg *a = malloc(sizeof *a);   /* lo conserva el hilo */
+        a->T = T; a->tid = i;
+        pthread_create(&T->th[i], NULL, tier_worker, a);
+    }
+}
+
+/* Encola las 6 lecturas de un experto. Con el mutex ya tomado. */
+static void tier_submit(ExpertTier *T, int slot, int layer, int e)
+{
+    T->slots[slot].pending = 6;
+    for (int k = 0; k < 6; k++) {
+        T->q[T->qtail] = (RdJob){ slot, layer, e, k };
+        T->qtail = (T->qtail + 1) % T->qcap;
+    }
+    pthread_cond_broadcast(&T->cv_job);
+}
+
+/* Espera a que un slot tenga sus 6 tensores. */
+static void tier_wait(ExpertTier *T, int slot)
+{
+    const double t0 = now_s();
+    pthread_mutex_lock(&T->mu);
+    while (T->slots[slot].pending) pthread_cond_wait(&T->cv_done, &T->mu);
+    pthread_mutex_unlock(&T->mu);
+    g_t_io += now_s() - t0;   /* ahora mide ESPERA, no lectura: es lo que cuesta */
 }
 
 /* Trae de golpe los `n` expertos que el router acaba de elegir.
@@ -230,29 +324,15 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
         nw++;
     }
     if (!nw) return;
-
-    const double t0 = now_s();
     g_pf_batches++; g_pf_reads += (uint64_t)nw;
-    for (int j = 0; j < nw; j++) tier_alloc(T, slot[j], layer, want[j]);
 
-    /* Se reparte por TENSOR, no por experto. Repartiendo por experto cada hilo
-     * hacía sus 6 lecturas en serie, así que con ~3,2 expertos por tanda la
-     * profundidad de cola efectiva era 3,2 y no 19 — y un NVMe da su ancho de
-     * banda con la cola llena. Los 6*nw trabajos son independientes. */
-    const int njob = nw * 6;
-#ifdef _OPENMP
-#   pragma omp parallel for schedule(dynamic, 1) if (njob > 1)
-#endif
-    for (int j = 0; j < njob; j++) {
-#ifdef _OPENMP
-        const int tid = omp_get_thread_num();
-        if (j == 0) g_pf_threads = omp_get_num_threads();
-#else
-        const int tid = 0;
-#endif
-        tier_read_one(T, slot[j / 6], layer, want[j / 6], j % 6, tid);
-    }
-    g_t_io += now_s() - t0;
+    /* Se encola y se vuelve. Se reparte por TENSOR y no por experto: con ~3,2
+     * expertos por tanda, un trabajo por experto dejaría la cola del NVMe a
+     * profundidad 3,2 en vez de 19. */
+    for (int j = 0; j < nw; j++) tier_alloc(T, slot[j], layer, want[j]);
+    pthread_mutex_lock(&T->mu);
+    for (int j = 0; j < nw; j++) tier_submit(T, slot[j], layer, want[j]);
+    pthread_mutex_unlock(&T->mu);
 }
 
 /* Devuelve los descriptores del experto. Tras `tier_prefetch` siempre acierta;
@@ -263,13 +343,14 @@ static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4
     if (hit < 0) {
         T->miss++;
         hit = tier_reserve(T);
-        const double t0 = now_s();
         const uint64_t b0 = T->bytes;
         tier_alloc(T, hit, layer, e);
-        for (int k = 0; k < 6; k++) tier_read_one(T, hit, layer, e, k, 0);
+        pthread_mutex_lock(&T->mu);
+        tier_submit(T, hit, layer, e);
+        pthread_mutex_unlock(&T->mu);
         g_fb_bytes += T->bytes - b0;
-        g_t_io += now_s() - t0;
     }
+    tier_wait(T, hit);   /* tras el prefetch suele volver sin bloquear */
 
     ExpSlot *s = &T->slots[hit];
     s->used = ++T->clock;
@@ -636,10 +717,10 @@ int main(int argc, char **argv) {
     printf("\n\n%d tokens en %.1f s (%.2f tok/s)\n", n + ngen, dt, (n + ngen) / dt);
     printf("perfil (total): atencion %.1f s | MoE %.1f s | head %.1f s | resto %.1f s\n",
            g_t_attn, g_t_moe, g_t_head, dt - g_t_attn - g_t_moe - g_t_head);
-    printf("  I/O: %llu tandas de prefetch, %.1f lecturas por tanda, %d hilos activos\n"
+    printf("  I/O: %llu tandas de prefetch, %.1f expertos por tanda, %d lectores\n"
            "       %.2f GB por prefetch, %.2f GB por el camino de respaldo\n",
            (unsigned long long)g_pf_batches,
-           g_pf_batches ? (double)g_pf_reads / g_pf_batches : 0.0, g_pf_threads,
+           g_pf_batches ? (double)g_pf_reads / g_pf_batches : 0.0, M.tier.nthreads,
            (double)(M.tier.bytes - g_fb_bytes) / 1e9, (double)g_fb_bytes / 1e9);
     printf("  del MoE, %.1f s son I/O de expertos y %.1f s computo\n",
            g_t_io, g_t_moe - g_t_io);

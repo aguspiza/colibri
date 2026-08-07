@@ -19,6 +19,10 @@ expertos: 1765 hits / 1847 miss (49% acierto), 24.69 GB leidos
 En un Ryzen 5700U (Zen 2, **sin AVX-512**) con 17,9 GB de RAM libre y el
 checkpoint en un NVMe.
 
+> La bitácora completa de optimización —cómo se llegó de 0,16 a 0,78 tok/s, y
+> las tres hipótesis obvias que resultaron falsas— está en
+> [deepseek-v4-rendimiento.md](deepseek-v4-rendimiento.md).
+
 ## Dónde se iba el tiempo
 
 La primera versión daba 0,16 tok/s. Medir antes de tocar nada dejó el reparto
