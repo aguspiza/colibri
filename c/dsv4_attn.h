@@ -1,15 +1,15 @@
-/* dsv4_attn.h — el bloque de atención completo (prefill).
+/* dsv4_attn.h — the complete attention block (prefill).
  *
- * Ensambla las primitivas ya validadas de `dsv4_math.h` siguiendo
- * `ref/model.py::Attention.forward` (líneas 497-548).
+ * Assembles the already-validated primitives from dsv4_math.h following
+ * ref/model.py::Attention.forward.
  *
- * Cubre el camino `compress_ratio == 0`: ventana deslizante pura, sin
- * Compressor ni Indexer. Las capas con compresión añaden la KV comprimida y los
- * índices del indexer al mismo esqueleto (ambos ya validados por separado).
+ * The `compress_ratio == 0` path is a pure sliding window, with no Compressor and
+ * no Indexer. Compressed layers add the compressed KV and the indexer's indices
+ * onto the same skeleton (both validated separately).
  *
- * Precisión: `model.py` corre con dtype por defecto bf16, así que cada matmul
- * acumula en f32 y **redondea la salida a bf16**. Es la misma regla que hizo
- * falta en el Compressor y en el indexer.
+ * Precision: model.py runs with bf16 as the default dtype, so every matmul
+ * accumulates in f32 and ROUNDS ITS OUTPUT to bf16. Same rule that turned out to
+ * be needed in the Compressor and in the indexer.
  */
 
 #ifndef DSV4_ATTN_H
@@ -20,12 +20,12 @@
 
 /* y[rows, out] = x[rows, in] @ w[out, in]^T
  *
- * `bf16out` decide si la salida se redondea. NO es un detalle de rendimiento:
- * las capas `Linear` del modelo son bf16 y redondean, pero las del Compressor
- * se declaran explícitamente en fp32 (`model.py:303-304`, con un comentario que
- * dice que en el checkpoint van en bf16 y aquí se suben a fp32 "por
- * comodidad"). Usar la variante equivocada mete un error que sólo se ve al
- * cuantizar después. */
+ * `bf16out` decides whether the output is rounded. This is NOT a performance
+ * detail: the model's `Linear` layers are bf16 and do round, but the
+ * Compressor's are explicitly declared fp32 (model.py, with a comment saying the
+ * checkpoint stores them in bf16 and they are promoted to fp32 "for
+ * convenience"). Using the wrong variant injects an error that only becomes
+ * visible once the result is quantized further down. */
 static inline void dsv4_matmul_ex(float *y, const float *x, const float *w,
                                   int64_t rows, int in, int out, int bf16out) {
     for (int64_t r = 0; r < rows; r++) {
@@ -45,11 +45,11 @@ static inline void dsv4_matmul(float *y, const float *x, const float *w,
     dsv4_matmul_ex(y, x, w, rows, in, out, 1);
 }
 
-/* Índices de la ventana deslizante en prefill (`get_window_topk_idxs`).
+/* Sliding-window indices for prefill (`get_window_topk_idxs`).
  *
- * Cada posición atiende a las `win` anteriores incluida ella misma; lo que caiga
- * antes del principio de la secuencia se marca -1 y `sparse_attn` lo ignora.
- * Con seqlen <= win queda una máscara causal pura.
+ * Each position attends to the `win` preceding ones including itself; anything
+ * falling before the start of the sequence is marked -1 and `sparse_attn` skips
+ * it. With seqlen <= win this reduces to a plain causal mask.
  *
  *   out : [b, s, min(s, win)]
  */
@@ -70,30 +70,30 @@ static inline int dsv4_window_topk_prefill(int *out, int b, int s, int win) {
 typedef struct {
     int dim, q_lora, heads, hd, rd, groups, o_lora, win;
     float scale, eps;
-    /* compresión (0 = capa de ventana pura) */
+    /* compression (0 = pure window layer) */
     int ratio, i_heads, i_hd, i_topk;
     float i_scale;
 } DsV4AttnCfg;
 
-/* Las MATRICES van como descriptor (`DsV4W`): en el checkpoint real están en
- * FP8/BF16/MXFP4 y no caben dequantizadas. Los VECTORES —normas, `attn_sink`,
- * `ape`— se quedan en f32 porque ocupan unos pocos MB en total y convertirlos al
- * cargar no cuesta nada. Distinguirlos así recorta el refactor a lo que de
- * verdad importa. */
+/* MATRICES are passed as descriptors (`DsV4W`): in the real checkpoint they are
+ * FP8/BF16/MXFP4 and do not fit dequantized. VECTORS — norms, `attn_sink`, `ape`
+ * — stay f32 because they are a few MB in total and converting them at load time
+ * costs nothing. Drawing the line there keeps the refactor down to what actually
+ * matters. */
 typedef struct {
     DsV4W wq_a, wq_b, wkv, wo_a, wo_b;
     const float *q_norm, *kv_norm, *attn_sink;
     const float *freqs;          /* [max_seq, rd/2, 2] */
 
-    /* Sólo si compress_ratio != 0. El Compressor principal comprime la KV que
-     * se atiende; el del Indexer construye una KV propia, más pequeña, contra
-     * la que puntuar. Son dos compresiones distintas del mismo `x`. */
+    /* Only when compress_ratio != 0. The main Compressor compresses the KV that
+     * gets attended to; the Indexer's own Compressor builds a separate, smaller
+     * KV to score against. They are two different compressions of the same `x`. */
     DsV4W c_wkv, c_wgate, i_wkv, i_wgate, i_wq_b, i_wproj;
     const float *c_ape, *c_norm, *i_ape, *i_norm;
 } DsV4AttnW;
 
-/* x   : [b, s, dim]     entrada del bloque (ya normalizada por attn_norm)
- * topk: [b, s, ntopk]   índices de ventana (+ los del indexer si los hubiera)
+/* x   : [b, s, dim]     the block's input (already normalized by attn_norm)
+ * topk: [b, s, ntopk]   window indices (+ the indexer's, when present)
  * out : [b, s, dim]                                                          */
 static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
                                           const DsV4AttnW *w,
@@ -118,8 +118,8 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
     }
     dsv4_matmul_w(q, qr, &w->wq_b, (int)bs, 1);
 
-    /* SEGUNDA normalización de q: RMS **sin pesos**, ya por cabeza. No sale en
-     * la config y es facilísima de saltarse — `model.py:504`. */
+    /* A SECOND normalization of q: RMS with NO weights, per head this time. It
+     * does not appear in the config and is extremely easy to miss. */
     for (int64_t r = 0; r < bs; r++) {
         for (int h = 0; h < c->heads; h++) {
             float *v = q + r * qdim + (size_t)h * c->hd;
@@ -130,7 +130,7 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
         }
     }
 
-    /* RoPE sobre los últimos rd canales de cada cabeza */
+    /* RoPE over the last rd channels of each head */
     for (int64_t r = 0; r < bs; r++)
         for (int h = 0; h < c->heads; h++) {
             const int pos = (int)(r % s);
@@ -151,8 +151,8 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
         dsv4_rope(kv + r * c->hd + (c->hd - c->rd),
                   w->freqs + (size_t)pos * (c->rd / 2) * 2, 1, 1, 1, c->rd, 0);
     }
-    /* Sólo los canales NO-rope se cuantizan: en los de rope la precisión
-     * posicional importa y se dejan en bf16. */
+    /* Only the NON-rope channels get quantized: positional precision matters in
+     * the rope ones, so those stay bf16. */
     {
         const int nrope = c->hd - c->rd;
         float *tmp = malloc((size_t)bs * nrope * sizeof(float));
@@ -164,11 +164,11 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
         free(tmp);
     }
 
-    /* --- KV comprimida e índices del indexer ----------------------------- */
-    /* En las capas con compresión la atención mira a DOS zonas: la ventana
-     * deslizante reciente (los `s` tokens tal cual) y los bloques comprimidos
-     * que vienen detrás. Los índices del indexer ya llegan desplazados por
-     * `offset = s`, que es donde empieza la segunda zona. */
+    /* --- compressed KV and the indexer's indices ------------------------- */
+    /* In compressed layers attention looks at TWO regions: the recent sliding
+     * window (the `s` tokens as they are) and the compressed blocks behind them.
+     * The indexer's indices already arrive shifted by `offset = s`, which is
+     * where the second region begins. */
     float *kv_cat = kv;
     const int *tk_use = topk;
     int n_kv = s, ntk = ntopk;
@@ -180,7 +180,7 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
         const int overlap = (c->ratio == 4);
         const int coff = overlap ? 2 : 1;
 
-        /* Compressor principal: fp32, sin redondeo en los matmuls */
+        /* Main Compressor: fp32, no rounding in its matmuls */
         float *ckv = malloc((size_t)bs * coff * c->hd * sizeof(float));
         float *csc = malloc((size_t)bs * coff * c->hd * sizeof(float));
         dsv4_matmul_w(ckv, x, &w->c_wkv, (int)bs, 0);
@@ -191,14 +191,14 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
                               c->eps, kv_comp);
         free(ckv); free(csc);
 
-        /* SÓLO las capas con ratio == 4 tienen Indexer (`model.py:474`). Las de
-         * ratio alto —las HCA, con 128 en el modelo real— no aprenden a
-         * seleccionar: atienden a TODOS los bloques comprimidos causalmente
-         * disponibles, en orden. Tiene sentido: con ratio 128 hay tan pocos
-         * bloques que seleccionar no ahorra nada.
+        /* ONLY layers with ratio == 4 have an Indexer. The high-ratio ones —
+         * the HCA layers, 128 in the real model — do not learn to select: they
+         * attend to ALL causally available compressed blocks, in order. Which
+         * makes sense: at ratio 128 there are so few blocks that selecting saves
+         * nothing.
          *
-         * Es una asimetría que no se ve en el config.json y que cambia el
-         * trabajo del motor: en esas capas no hay que puntuar nada. */
+         * It is an asymmetry that does not show up in config.json and it changes
+         * what the engine has to do: in those layers there is nothing to score. */
         int keep;
         if (c->ratio != 4) {
             keep = ngrp;
@@ -209,7 +209,7 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
                     ctopk[r * keep + k] = (k >= limit) ? -1 : k + s;
             }
         } else {
-            /* Compressor del Indexer: su propia KV, más pequeña, Hadamard+FP4 */
+            /* The Indexer's Compressor: its own smaller KV, Hadamard+FP4 */
             float *ikv = malloc((size_t)bs * coff * c->i_hd * sizeof(float));
             float *isc = malloc((size_t)bs * coff * c->i_hd * sizeof(float));
             dsv4_matmul_w(ikv, x, &w->i_wkv, (int)bs, 0);
@@ -220,7 +220,7 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
                                   c->eps, ikvc);
             free(ikv); free(isc);
 
-            /* q del indexer: wq_b -> RoPE -> Hadamard -> FP4 */
+            /* the indexer's q: wq_b -> RoPE -> Hadamard -> FP4 */
             const int iqdim = c->i_heads * c->i_hd;
             float *iq = malloc((size_t)bs * iqdim * sizeof(float));
             dsv4_matmul_w(iq, qr, &w->i_wq_b, (int)bs, 1);
@@ -277,7 +277,7 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
         if (kv_cat != kv) free(kv_cat);
     }
 
-    /* RoPE INVERSA sobre la salida antes de la proyección (`model.py:539`) */
+    /* INVERSE RoPE on the output, before the projection */
     for (int64_t r = 0; r < bs; r++)
         for (int h = 0; h < c->heads; h++) {
             const int pos = (int)(r % s);
@@ -286,13 +286,13 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
                       1, 1, 1, c->rd, 1);
         }
 
-    /* --- proyección de salida agrupada: o = wo_b(einsum(o, wo_a)) ------- */
-    const int dpg = qdim / c->groups;              /* canales por grupo */
+    /* --- grouped output projection: o = wo_b(einsum(o, wo_a)) ----------- */
+    const int dpg = qdim / c->groups;              /* channels per group */
     float *mid = malloc((size_t)bs * c->groups * c->o_lora * sizeof(float));
     for (int g = 0; g < c->groups; g++) {
-        /* `wo_a` visto como [groups, o_lora, dpg]: cada grupo es su bloque de
-         * filas. Se rebana el descriptor en vez de indexar bytes a mano, así
-         * funciona igual con f32, BF16 o FP8. */
+        /* `wo_a` viewed as [groups, o_lora, dpg]: each group is its own block of
+         * rows. The descriptor is sliced instead of indexing bytes by hand, so it
+         * works the same for f32, BF16 or FP8. */
         const DsV4W wg = dsv4_w_rows(&w->wo_a, g * c->o_lora, c->o_lora);
         for (int64_t r = 0; r < bs; r++)
             dsv4_matmul_w(mid + (r * c->groups + g) * c->o_lora,

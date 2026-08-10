@@ -1,23 +1,23 @@
-/* dsv4_decode.h — generación token a token (start_pos > 0).
+/* dsv4_decode.h — token-by-token generation (start_pos > 0).
  *
- * Hasta aquí el motor sólo sabía hacer *prefill*: procesar el prompt entero de
- * una vez. Eso basta para predecir UN token; para generar texto hace falta el
- * camino incremental, que es distinto en tres sitios:
+ * Up to here the engine only knew how to *prefill*: process the whole prompt in
+ * one go. That is enough to predict ONE token; generating text needs the
+ * incremental path, which differs in three places:
  *
- *   1. La KV de la ventana vive en un **buffer circular** de `win` entradas. En
- *      prefill se escribe ordenada; en decode cada token pisa la posición
- *      `start_pos % win`. Los índices que recibe `sparse_attn` son posiciones
- *      DEL ANILLO, no de la secuencia — confundirlos es el error clásico.
+ *   1. The window's KV lives in a RING BUFFER of `win` entries. Prefill writes it
+ *      in order; in decode each token overwrites position `start_pos % win`. The
+ *      indices `sparse_attn` receives are RING positions, not sequence
+ *      positions — confusing the two is the classic bug here.
  *
- *   2. El Compressor no puede comprimir un bloque hasta tenerlo entero, así que
- *      acumula los tokens sueltos en `kv_state`/`score_state` y sólo emite una
- *      entrada comprimida cuando `(start_pos+1) % ratio == 0`.
+ *   2. The Compressor cannot compress a block until it has all of it, so it
+ *      accumulates the individual tokens in `kv_state`/`score_state` and only
+ *      emits a compressed entry when `(start_pos+1) % ratio == 0`.
  *
- *   3. Los índices de la KV comprimida ya no llevan máscara causal: todo lo
- *      comprimido está por definición en el pasado.
+ *   3. The compressed KV's indices no longer carry a causal mask: anything
+ *      compressed is by definition in the past.
  *
- * Sigue `ref/model.py`: `Attention.forward` (rama else), `Compressor.forward`
- * (rama else) y `get_window_topk_idxs` / `get_compress_topk_idxs`.
+ * Follows ref/model.py: `Attention.forward` (else branch), `Compressor.forward`
+ * (else branch) and `get_window_topk_idxs` / `get_compress_topk_idxs`.
  */
 
 #ifndef DSV4_DECODE_H
@@ -25,20 +25,20 @@
 
 #include "dsv4_attn.h"
 
-/* Estado persistente entre tokens. En colibrì esto es lo que se guarda en
- * `.coli_kv` para que una conversación se reabra CALIENTE, sin re-prefill. */
+/* State that persists between tokens. In colibri this is what gets written to
+ * `.coli_kv` so a conversation reopens WARM, with no re-prefill. */
 typedef struct {
     int b, hd, win, ncomp, ratio, coff;
     float *kv;            /* [b, win + ncomp, hd]  ventana (anillo) + comprimidos */
     float *kv_state;      /* [b, coff*ratio, coff*hd]  bloque en curso */
     float *score_state;
-    /* El Indexer tiene su PROPIO Compressor, con otra dimensión y otra caché:
-     * construye una KV más pequeña contra la que puntuar. Son dos compresiones
-     * distintas del mismo `x` y necesitan dos estados. */
+    /* The Indexer has its OWN Compressor, with a different dimension and its own
+     * cache: it builds a smaller KV to score against. Two different compressions
+     * of the same `x`, so two separate states. */
     int i_hd;
     float *i_kv;          /* [b, ncomp, i_hd] */
     float *i_kv_state, *i_score_state;
-    int n_written;        /* tokens ya vistos, para saber dónde escribir */
+    int n_written;        /* tokens seen so far, i.e. where to write next */
 } DsV4AttnState;
 
 static inline void dsv4_state_init_full(DsV4AttnState *st, int b, int hd,
@@ -53,12 +53,12 @@ static inline void dsv4_state_init_full(DsV4AttnState *st, int b, int hd,
     if (ratio) {
         const size_t n = (size_t)b * st->coff * ratio * st->coff * hd;
         st->kv_state = (float *)calloc(n, sizeof(float));
-        /* score_state arranca a -inf: las ranuras aún sin token no deben pesar
-         * en el softmax del pooling. `model.py` lo inicializa igual. */
+        /* score_state starts at -inf: slots with no token yet must not weigh in
+         * the pooling softmax. model.py initializes it the same way. */
         st->score_state = (float *)malloc(n * sizeof(float));
         for (size_t i = 0; i < n; i++) st->score_state[i] = -INFINITY;
 
-        if (i_hd > 0 && ratio == 4) {      /* sólo ratio 4 tiene Indexer */
+        if (i_hd > 0 && ratio == 4) {      /* only ratio 4 has an Indexer */
             st->i_hd = i_hd;
             st->i_kv = (float *)calloc((size_t)b * st->ncomp * i_hd, sizeof(float));
             const size_t m = (size_t)b * st->coff * ratio * st->coff * i_hd;
@@ -80,10 +80,10 @@ static inline void dsv4_state_free(DsV4AttnState *st) {
     memset(st, 0, sizeof *st);
 }
 
-/* Índices de la ventana en decode: posiciones del ANILLO, de la más antigua a
- * la más reciente. Port de `get_window_topk_idxs` con start_pos > 0.
+/* Window indices in decode: RING positions, oldest to newest. A port of
+ * `get_window_topk_idxs` with start_pos > 0.
  *
- *   out : [b, 1, win]   (-1 en las ranuras aún sin escribir)
+ *   out : [b, 1, win]   (-1 for slots not written yet)
  */
 static inline void dsv4_window_topk_decode(int *out, int b, int win,
                                            int start_pos)
@@ -91,22 +91,22 @@ static inline void dsv4_window_topk_decode(int *out, int b, int win,
     for (int bi = 0; bi < b; bi++) {
         int *row = out + (size_t)bi * win;
         if (start_pos >= win - 1) {
-            /* anillo lleno: se lee desde la siguiente a la última escrita */
+            /* ring is full: read starting just after the last one written */
             const int p = start_pos % win;
             int k = 0;
             for (int i = p + 1; i < win; i++) row[k++] = i;
             for (int i = 0; i <= p; i++) row[k++] = i;
         } else {
-            /* aún no ha dado la vuelta: 0..start_pos y el resto vacío */
+            /* has not wrapped yet: 0..start_pos, the rest empty */
             for (int i = 0; i <= start_pos; i++) row[i] = i;
             for (int i = start_pos + 1; i < win; i++) row[i] = -1;
         }
     }
 }
 
-/* Índices de la KV comprimida en decode. Sin máscara causal: lo comprimido ya
- * es pasado por construcción. `offset` es `win`, donde empieza la segunda zona.
- * Devuelve cuántos hay. */
+/* Compressed-KV indices in decode. No causal mask: what is compressed is already
+ * in the past by construction. `offset` is `win`, where the second region starts.
+ * Returns how many there are. */
 static inline int dsv4_compress_topk_decode(int *out, int b, int ratio,
                                             int start_pos, int offset)
 {
@@ -117,13 +117,13 @@ static inline int dsv4_compress_topk_decode(int *out, int b, int ratio,
 }
 
 /* ---------------------------------------------------------------------------
- * Compressor incremental.
+ * The incremental Compressor.
  *
- * Devuelve 1 si ha emitido una entrada comprimida (y la deja en `out`), 0 si
- * todavía está acumulando. Sólo cierra bloque cuando `(start_pos+1) % ratio`
- * llega a cero, que es la razón de que haga falta estado entre tokens.
+ * Returns 1 if it emitted a compressed entry (left in `out`), 0 if it is still
+ * accumulating. It only closes a block when `(start_pos+1) % ratio` reaches zero,
+ * which is precisely why state has to survive between tokens.
  *
- *   kv_in, score : [coff*hd]  proyecciones del token actual
+ *   kv_in, score : [coff*hd]  the current token's projections
  * ------------------------------------------------------------------------- */
 static inline int dsv4_compress_decode_st(float *ks_all, float *ss_all,
                                           int hd, int ratio, int coff,
@@ -140,20 +140,20 @@ static inline int dsv4_compress_decode_st(float *ks_all, float *ss_all,
     float *ks = ks_all + (size_t)bi * slots * chan;
     float *ss = ss_all + (size_t)bi * slots * chan;
 
-    /* La ranura donde cae este token. Con solapamiento la mitad alta del anillo
-     * es el bloque en curso y la baja el anterior. */
+    /* Which slot this token lands in. With overlap, the ring's upper half is the
+     * block in progress and the lower half is the previous one. */
     const int slot = (coff == 2) ? ratio + r : r;
     for (int c = 0; c < chan; c++) {
         ks[(size_t)slot * chan + c] = kv_in[c];
-        /* `ape` se indexa por la posición DENTRO del bloque */
+        /* `ape` is indexed by the position WITHIN the block */
         ss[(size_t)slot * chan + c] = score[c] + ape[(size_t)r * chan + c];
     }
 
     if ((start_pos + 1) % ratio != 0) return 0;      /* bloque aún abierto */
 
-    /* Pooling con puerta sobre las ranuras. Con solapamiento se toman los
-     * canales BAJOS del bloque anterior y los ALTOS del actual — el mismo
-     * reparto que hace `overlap_transform` en prefill. */
+    /* Gated pooling over the slots. With overlap, the LOW channels come from the
+     * previous block and the HIGH ones from the current block — the same split
+     * `overlap_transform` performs in prefill. */
     const int nslot = slots;
     for (int d = 0; d < hd; d++) {
         float mx = -INFINITY;
@@ -173,7 +173,7 @@ static inline int dsv4_compress_decode_st(float *ks_all, float *ss_all,
         out[d] = acc / sum;
     }
 
-    /* rotar el anillo: el bloque que se cierra pasa a ser "el anterior" */
+    /* rotate the ring: the block just closed becomes "the previous one" */
     if (coff == 2)
         for (int j = 0; j < ratio; j++) {
             memcpy(ks + (size_t)j * chan, ks + (size_t)(ratio + j) * chan,
@@ -182,14 +182,14 @@ static inline int dsv4_compress_decode_st(float *ks_all, float *ss_all,
                    (size_t)chan * sizeof(float));
         }
 
-    /* norm -> RoPE -> cuantización, igual que en prefill */
+    /* norm -> RoPE -> quantization, same as prefill */
     for (int d = 0; d < hd; d++) out[d] = dsv4_to_bf16(out[d]);
     float *tmp = (float *)malloc((size_t)hd * sizeof(float));
     dsv4_rmsnorm(tmp, out, norm_w, hd, eps);
     for (int d = 0; d < hd; d++) out[d] = dsv4_to_bf16(tmp[d]);
     free(tmp);
 
-    /* La posición del bloque es la de su PRIMER token: start_pos+1-ratio. */
+    /* A block's position is that of its FIRST token: start_pos+1-ratio. */
     dsv4_rope(out + (hd - rd),
               freqs + (size_t)(start_pos + 1 - ratio) * (rd / 2) * 2,
               1, 1, 1, rd, 0);
@@ -204,11 +204,11 @@ static inline int dsv4_compress_decode_st(float *ks_all, float *ss_all,
 }
 
 /* ---------------------------------------------------------------------------
- * Un token. `x` es [b, dim]; `out` es [b, dim].
+ * One token. `x` is [b, dim]; `out` is [b, dim].
  *
- * Cubre la ruta sin compresión y la de compresión sin indexer (ratio != 4). La
- * de ratio 4 necesita además el indexer sobre la KV comprimida, que en decode
- * puntúa igual pero sin máscara causal.
+ * Covers the uncompressed path and the compressed-without-indexer one
+ * (ratio != 4). The ratio-4 path additionally needs the indexer over the
+ * compressed KV, which scores the same way in decode but without a causal mask.
  * ------------------------------------------------------------------------- */
 static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
                                          const DsV4AttnW *w,
@@ -243,7 +243,7 @@ static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
                       1, 1, 1, c->rd, 0);
         }
 
-    /* --- kv del token, al anillo --- */
+    /* --- the token's kv, into the ring --- */
     dsv4_matmul_w(kv, x, &w->wkv, b, 1);
     for (int bi = 0; bi < b; bi++) {
         dsv4_rmsnorm(tmp, kv + (size_t)bi * c->hd, w->kv_norm, c->hd, c->eps);
@@ -254,7 +254,7 @@ static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
                   1, 1, 1, c->rd, 0);
         dsv4_blockwise_quant(kv + (size_t)bi * c->hd, 1, c->hd - c->rd, 64, 1,
                              DSV4_FP8);
-        /* el anillo: este token pisa la ranura start_pos % win */
+        /* the ring: this token overwrites slot start_pos % win */
         memcpy(st->kv + ((size_t)bi * (st->win + st->ncomp)
                          + (start_pos % st->win)) * c->hd,
                kv + (size_t)bi * c->hd, (size_t)c->hd * sizeof(float));
@@ -282,7 +282,7 @@ static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
         free(ck); free(cs); free(emit);
         ncomp_avail = (start_pos + 1) / c->ratio;
 
-        /* El Compressor del Indexer, en paralelo: su propia KV comprimida. */
+        /* The Indexer's Compressor, alongside: its own compressed KV. */
         if (c->ratio == 4 && st->i_kv) {
             float *ik = (float *)malloc((size_t)b * coff * c->i_hd * sizeof(float));
             float *is = (float *)malloc((size_t)b * coff * c->i_hd * sizeof(float));
@@ -304,10 +304,10 @@ static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
         }
     }
 
-    /* --- índices y atención --- */
-    /* En las capas con indexer, la KV comprimida no se atiende entera: el
-     * indexer elige las `index_topk` mejores. En decode NO hay máscara causal
-     * —todo lo comprimido es pasado— así que sólo se puntúa y se ordena. */
+    /* --- indices and attention --- */
+    /* In layers with an indexer the compressed KV is not attended in full: the
+     * indexer picks the best `index_topk`. In decode there is NO causal mask —
+     * everything compressed is past — so it only scores and sorts. */
     int keep = ncomp_avail;
     int *ctopk = NULL;
     if (c->ratio == 4 && st->i_kv && ncomp_avail > 0) {
@@ -328,9 +328,9 @@ static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
 
         keep = (c->i_topk < ncomp_avail) ? c->i_topk : ncomp_avail;
         ctopk = (int *)malloc((size_t)b * keep * sizeof(int));
-        /* `no_causal=1`: en decode todo lo comprimido es pasado. Pasar
-         * ratio=1 para "desactivar" la máscara NO vale — da limit=1 y recorta
-         * a un solo bloque (medido: 2,4e-1 de error con dos bloques). */
+        /* `no_causal=1`: in decode everything compressed is past. Passing
+         * ratio=1 to "disable" the mask does NOT work — it yields limit=1 and
+         * clips to a single block (measured: 2.4e-1 error with two blocks). */
         dsv4_indexer_topk_ex(iq, st->i_kv, iw, b, 1, c->i_heads, c->i_hd,
                              st->ncomp, ncomp_avail, c->ratio, keep,
                              st->win /*offset*/, c->i_scale, 1, ctopk);
@@ -358,7 +358,7 @@ static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
                       w->freqs + (size_t)start_pos * (c->rd / 2) * 2,
                       1, 1, 1, c->rd, 1);
 
-    /* --- proyección de salida agrupada --- */
+    /* --- grouped output projection --- */
     const int dpg = qdim / c->groups;
     float *mid = (float *)malloc((size_t)b * c->groups * c->o_lora * sizeof(float));
     for (int g = 0; g < c->groups; g++) {
