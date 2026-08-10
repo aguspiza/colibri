@@ -154,7 +154,10 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
-// scale live at gpuAddresses waddr[e]/saddr[e] (zero-copy in the RAM slab). fmt 1=i8, 2=i4.
+// scale live at gpuAddresses waddr[e]/saddr[e] (zero-copy in the RAM slab). fmt 1=i8, 2=i4
+// per-row, 4=i4 grouped (scale layout [O][ng], ng=ceil(K/qgs) -- same convention as mm_gemv
+// fmt=4 above, but folded into the vectorized uchar4/float4 dot-product loop this kernel's
+// fmt=2 branch already uses, since moe_gemv has no scalar strided branch to reuse).
 // One SIMDGROUP per output row, 4 rows/threadgroup, 8-value loads: measured 1.5-2.1x over
 // one-threadgroup-per-row with uchar2 loads (358-389 GB/s on engine-like block shapes).
 kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong* saddr [[buffer(1)]],
@@ -162,7 +165,7 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
                      device float* yout [[buffer(4)]],
                      constant int& O [[buffer(5)]], constant int& K [[buffer(6)]],
                      constant int& Kin [[buffer(7)]], constant int& fmt [[buffer(8)]],
-                     constant int& NT [[buffer(9)]],
+                     constant int& NT [[buffer(9)]], constant int& qgs [[buffer(10)]],
                      uint tg [[threadgroup_position_in_grid]],
                      uint slane [[thread_index_in_simdgroup]],
                      uint sgid [[simdgroup_index_in_threadgroup]]) {
@@ -200,13 +203,35 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
         acc += (dot(m0*sA,xs[l*2]) + dot(m1*sB,xs[l*2+1])) * (0.5f*db);
       }
     }
+  } else if (fmt == 5) {                            // bf16 raw rows: no scales, upper half of f32
+    device const ushort* w=(device const ushort*)(waddr[e])+(long)o*K;
+    device const ushort4* w4=(device const ushort4*)w;
+    for(int c=slane;c<K8;c+=32){ ushort4 a=w4[2*c], b=w4[2*c+1];
+      float4 w0=float4(as_type<float>(uint(a.x)<<16), as_type<float>(uint(a.y)<<16),
+                       as_type<float>(uint(a.z)<<16), as_type<float>(uint(a.w)<<16));
+      float4 w1=float4(as_type<float>(uint(b.x)<<16), as_type<float>(uint(b.y)<<16),
+                       as_type<float>(uint(b.z)<<16), as_type<float>(uint(b.w)<<16));
+      acc+=dot(w0,x4[2*c])+dot(w1,x4[2*c+1]); }
+    for(int i=K8*8+slane;i<K;i+=32) acc += as_type<float>(uint(w[i])<<16)*xr[i];
+  } else if (fmt == 4) {                            // grouped int4: per-expert scale [O][ng]
+    int rb=(K+1)/2, ng=(K+qgs-1)/qgs; device const uchar* w=(device const uchar*)(waddr[e])+(long)o*rb;
+    device const float* sr=sc+(long)o*ng;           // grouped scales for this output row
+    device const uchar4* w4=(device const uchar4*)w;
+    for(int c=slane;c<K8;c+=32){ uchar4 b=w4[c];
+      float4 w0=float4(float(int(b.x&0xF)-8),float(int(b.x>>4)-8),float(int(b.y&0xF)-8),float(int(b.y>>4)-8));
+      float4 w1=float4(float(int(b.z&0xF)-8),float(int(b.z>>4)-8),float(int(b.w&0xF)-8),float(int(b.w>>4)-8));
+      int g0=(8*c+0)/qgs,g1=(8*c+1)/qgs,g2=(8*c+2)/qgs,g3=(8*c+3)/qgs;
+      int g4=(8*c+4)/qgs,g5=(8*c+5)/qgs,g6=(8*c+6)/qgs,g7=(8*c+7)/qgs;
+      acc+=dot(w0*float4(sr[g0],sr[g1],sr[g2],sr[g3]),x4[2*c])
+          +dot(w1*float4(sr[g4],sr[g5],sr[g6],sr[g7]),x4[2*c+1]); }
+    for(int i=K8*8+slane;i<K;i+=32){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]*sr[i/qgs]; }
   } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
     device const char4* w4=(device const char4*)w;
     for(int c=slane;c<K8;c+=32) acc+=dot(float4(w4[2*c]),x4[2*c])+dot(float4(w4[2*c+1]),x4[2*c+1]);
     for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
   acc=simd_sum(acc);
-  if(slane==0) yout[row] = (fmt==6) ? acc : acc*sc[o];   // fmt=6: scales live in-block
+  if(slane==0) yout[row] = (fmt==4 || fmt==5 || fmt==6) ? acc : acc*sc[o];   // fmt4 grouped / fmt6 in-block scales folded; fmt5 none
 }
 
 // fmt=6 activation rotation for the GPU-resident down-projection input: one FWHT
@@ -267,14 +292,20 @@ kernel void a_copy(device const float* src [[buffer(0)]], constant int& off [[bu
 // ---- absorption core (S query rows, per-row causal). q:[S,H*QH]; qabs/clat:[S*H,KVL];
 //      sc:[S*H,T]; ctx:[S*H,VH]. Query row s (abs pos PB+s) attends keys [0, PB+s]. ----
 constant int A_QHH=A_H*A_QH;
-inline float a_deqrow(device const uchar* base, int row, int i, device const float* sc){
-  device const uchar* w=base+(long)row*((A_KVL+1)/2); uchar b=w[i>>1]; int val=(i&1)?(b>>4):(b&0xF); return float(val-8)*sc[row]; }
+// kv_b inline dequant of column i of output row `row`. fmt=2 -> one scale per row;
+// fmt=4 -> grouped int4, one scale per gs-wide group along the A_KVL input dim
+// (scale layout [O][ng], ng=ceil(A_KVL/gs)), matching QT fmt=4 / mm_gemv above.
+inline float a_deqrow(device const uchar* base, int row, int i, device const float* sc, int fmt, int gs){
+  device const uchar* w=base+(long)row*((A_KVL+1)/2); uchar b=w[i>>1]; int val=(i&1)?(b>>4):(b&0xF);
+  float s = (fmt==4) ? sc[(long)row*((A_KVL+gs-1)/gs) + i/gs] : sc[row];
+  return float(val-8)*s; }
 kernel void a_qabs(device const uchar* kvb [[buffer(0)]], device const float* sc [[buffer(1)]],
                    device const float* q [[buffer(2)]], device float* qabs [[buffer(3)]],
+                   constant int& fmt [[buffer(4)]], constant int& gs [[buffer(5)]],
                    uint gid [[thread_position_in_grid]]) {
   int s=gid/(A_H*A_KVL), r=gid%(A_H*A_KVL), h=r/A_KVL, i=r%A_KVL; int rbase=h*A_ROWSH;
   device const float* qp=q+(long)s*A_QHH+(long)h*A_QH;
-  float a=0; for(int d=0;d<A_NOPE;d++) a+=qp[d]*a_deqrow(kvb,rbase+d,i,sc); qabs[(long)(s*A_H+h)*A_KVL+i]=a;
+  float a=0; for(int d=0;d<A_NOPE;d++) a+=qp[d]*a_deqrow(kvb,rbase+d,i,sc,fmt,gs); qabs[(long)(s*A_H+h)*A_KVL+i]=a;
 }
 kernel void a_score(device const float* qabs [[buffer(0)]], device const float* Lc [[buffer(1)]],
                     device const float* Rc [[buffer(2)]], device const float* q [[buffer(3)]],
@@ -302,9 +333,11 @@ kernel void a_clat(device const float* sc [[buffer(0)]], device const float* Lc 
   for(int t=0;t<T;t++) a+=s[t]*Lc[(long)t*A_KVL+i]; clat[(long)sh*A_KVL+i]=a;
 }
 kernel void a_ctx(device const uchar* kvb [[buffer(0)]], device const float* sc [[buffer(1)]],
-                  device const float* clat [[buffer(2)]], device float* ctx [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+                  device const float* clat [[buffer(2)]], device float* ctx [[buffer(3)]],
+                  constant int& fmt [[buffer(4)]], constant int& gs [[buffer(5)]],
+                  uint gid [[thread_position_in_grid]]) {
   int sh=gid/A_VH, j=gid%A_VH, h=sh%A_H; int row=h*A_ROWSH+A_NOPE+j; device const float* cl=clat+(long)sh*A_KVL;
-  float a=0; for(int i=0;i<A_KVL;i++) a+=cl[i]*a_deqrow(kvb,row,i,sc); ctx[(long)sh*A_VH+j]=a;
+  float a=0; for(int i=0;i<A_KVL;i++) a+=cl[i]*a_deqrow(kvb,row,i,sc,fmt,gs); ctx[(long)sh*A_VH+j]=a;
 }
 
 // ===== full-layer tail kernels =====
@@ -799,15 +832,27 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
 // ---- fused decode attention scratch (GLM-5.2 dims) ----
 enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, ANOPE=192, AROWSH=448, AHQH=AHEADS*AQH, AHVH=AHEADS*AVH, AMAXS=4 };
 static id<MTLBuffer> ax_,aqr_,aqf_,acomp_,aqabs_,ascore_,aclat_,actx_,aout_,aqaln_,akvaln_; static size_t ascore_cap;
-static id<MTLBuffer> axr_,anrm_,ash1_,ash2_,ashout_,asig_,aidx_,aw_,akeff_;   // full-layer tail
+static size_t ax_cap,aqr_cap,aqf_cap,acomp_cap,aqabs_cap,aclat_cap,actx_cap,aout_cap;
+static id<MTLBuffer> axr_,anrm_,ash1_,ash2_,ashout_,asig_,aidx_,aw_,akeff_;   // full-layer tail (AMAXS-sized)
 static void attn_scratch_init(){
   if(ax_) return;
   auto L=[&](size_t n){ return [g_dev newBufferWithLength:n*AMAXS options:g_res_opts]; };
-  ax_=L(AH*4); aqr_=L(AQLORA*4); aqf_=L(AHQH*4); acomp_=L((AKVL+AROPE)*4);
-  aqabs_=L((size_t)AHEADS*AKVL*4); aclat_=L((size_t)AHEADS*AKVL*4); actx_=L(AHVH*4); aout_=L(AH*4);
-  aqaln_=L(AQLORA*4/AMAXS); akvaln_=L(AKVL*4/AMAXS);   // norm weights are per-tensor, not per-row
   axr_=L(AH*4); anrm_=L(AH*4); ash1_=L(2048*4); ash2_=L(2048*4); ashout_=L(AH*4);
   asig_=L(256*4); aidx_=L(8*4); aw_=L(8*4); akeff_=L(4);
+  aqaln_=[g_dev newBufferWithLength:AQLORA*4 options:g_res_opts];
+  akvaln_=[g_dev newBufferWithLength:AKVL*4 options:g_res_opts];
+}
+static void attn_scratch_reserve(int S, int T){
+  attn_scratch_init();
+  ax_=ensure(ax_,&ax_cap,(size_t)S*AH*4);
+  aqr_=ensure(aqr_,&aqr_cap,(size_t)S*AQLORA*4);
+  aqf_=ensure(aqf_,&aqf_cap,(size_t)S*AHQH*4);
+  acomp_=ensure(acomp_,&acomp_cap,(size_t)S*(AKVL+AROPE)*4);
+  aqabs_=ensure(aqabs_,&aqabs_cap,(size_t)S*AHEADS*AKVL*4);
+  ascore_=ensure(ascore_,&ascore_cap,(size_t)S*AHEADS*T*4);
+  aclat_=ensure(aclat_,&aclat_cap,(size_t)S*AHEADS*AKVL*4);
+  actx_=ensure(actx_,&actx_cap,(size_t)S*AHVH*4);
+  aout_=ensure(aout_,&aout_cap,(size_t)S*AH*4);
 }
 // y[S,O] = quantized-weight(w) applied to xin[S,I]. Weights are registered (page-aligned,
 // zero-copy) at model load; resolve to (buffer,offset). Returns false to fall back to CPU.
@@ -831,24 +876,24 @@ static bool bind_gemv(id<MTLComputeCommandEncoder> e, const void* w, const float
 
 // Weight-pointer bundle for one layer's attention (+optional layer tail). All pointers
 // must be inside registered allocations. *_gs: fmt=4 group size for the corresponding
-// weight (0 if that weight isn't grouped). kv_b has none: it never flows through bind_gemv
-// -- a_qabs/a_ctx dequantize it inline with a PER-ROW-only helper (a_deqrow), so a fmt=4
-// kv_b is out of scope for this stage (see PR_BODY.md UNCERTAINTIES).
+// weight (0 if that weight isn't grouped). kv_b never flows through bind_gemv -- a_qabs/
+// a_ctx dequantize it inline via a_deqrow, which is fmt/gs-aware (fmt=2 per-row, fmt=4
+// grouped along A_KVL); kvb_gs is that group size (0 for fmt=2).
 typedef struct {
   const void *qa_w; const float *qa_s; int qa_fmt; int qa_gs; const float *qa_ln;
   const void *qb_w; const float *qb_s; int qb_fmt; int qb_gs;
   const void *kva_w; const float *kva_s; int kva_fmt; int kva_gs; const float *kva_ln;
-  const void *kvb_w; const float *kvb_s; int kvb_fmt;
+  const void *kvb_w; const float *kvb_s; int kvb_fmt; int kvb_gs;
   const void *o_w;  const float *o_s;  int o_fmt; int o_gs;
 } AttnW;
 
-// Encode the fused attention chain into encoder e. Input: ax_ holds the NORMED x [S,AH].
-// Output: aout_ holds attention output [S,AH]. Returns false on unresolved weights.
-static bool encode_attention(id<MTLComputeCommandEncoder> e, const AttnW *W,
+// Phase 1: projections (qa, kva, qb, RMS, RoPE, qabs) for all S rows.
+// Reads ax_[S*AH], writes aqr_[S*AQLORA], acomp_[S*(AKVL+AROPE)], aqf_[S*AHQH], aqabs_[S*AHEADS*AKVL].
+// Also writes Lc (keys) and Rc (rope keys) into the KV cache at pos_base.
+static bool encode_attn_projections(id<MTLComputeCommandEncoder> e, const AttnW *W,
                              id<MTLBuffer> Lb, size_t loff, id<MTLBuffer> Rb, size_t roff,
                              id<MTLBuffer> kvbW, size_t kvbwoff, id<MTLBuffer> kvbS, size_t kvbsoff,
-                             int S, int pos_base, float eps, float theta, float ascale) {
-    int T=pos_base+S;
+                             int S, int pos_base, float eps, float theta) {
     memcpy([aqaln_ contents],W->qa_ln,AQLORA*4); memcpy([akvaln_ contents],W->kva_ln,AKVL*4);
     size_t Loff=loff+(size_t)pos_base*AKVL*4, Roff=roff+(size_t)pos_base*AROPE*4;
     auto BAR=[&]{ [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
@@ -868,16 +913,45 @@ static bool encode_attention(id<MTLComputeCommandEncoder> e, const AttnW *W,
     bind_gemv(e,W->qb_w,W->qb_s,W->qb_fmt,W->qb_gs,AQLORA,AHQH,aqr_,aqf_,S); rms(Lb,Loff,akvaln_,AKVL,S); rope(Rb,Roff,0,AROPE,0,1); BAR();
     rope(aqf_,0,ANOPE,AHQH,AQH,AHEADS); BAR();
     [e setComputePipelineState:g_a_qabs]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aqf_ offset:0 atIndex:2]; [e setBuffer:aqabs_ offset:0 atIndex:3];
+    [e setBytes:&W->kvb_fmt length:4 atIndex:4]; [e setBytes:&W->kvb_gs length:4 atIndex:5];
     [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
-    [e setComputePipelineState:g_a_score]; [e setBuffer:aqabs_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:Rb offset:roff atIndex:2]; [e setBuffer:aqf_ offset:0 atIndex:3]; [e setBuffer:ascore_ offset:0 atIndex:4];
-    [e setBytes:&T length:4 atIndex:5]; [e setBytes:&ascale length:4 atIndex:6]; [e setBytes:&pos_base length:4 atIndex:7];
-    [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*T,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    return true;
+}
+// Phase 2: chunked attention core for one chunk of ch rows (starting at r0 within the S-row batch).
+// Reads aqabs_[r0*AHEADS*AKVL], aqf_[r0*AHQH], Lb, Rb, kvbW, kvbS.
+// Writes actx_[r0*AHVH] (accumulated into the S-row ctx buffer).
+// Intermediate: ascore_[ch*AHEADS*T], aclat_[ch*AHEADS*AKVL] (per chunk, ephemeral).
+// T = total keys in the KV cache (pos_base_global + S_total). pos_base here = pos_base_global + r0
+// so that the score kernel's per-row causal length (pos - t + 1) is correct for this chunk.
+static bool encode_attn_core_chunk(id<MTLComputeCommandEncoder> e,
+                             id<MTLBuffer> Lb, size_t loff, id<MTLBuffer> Rb, size_t roff,
+                             id<MTLBuffer> kvbW, size_t kvbwoff, id<MTLBuffer> kvbS, size_t kvbsoff,
+                             int r0, int ch, int T, int pos_base, float ascale,
+                             int kvb_fmt, int kvb_gs) {
+    size_t qabs_off=(size_t)r0*AHEADS*AKVL*4, qf_off=(size_t)r0*AHQH*4, ctx_off=(size_t)r0*AHVH*4;
+    int PB=pos_base;
+    auto BAR=[&]{ [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+    [e setComputePipelineState:g_a_score]; [e setBuffer:aqabs_ offset:qabs_off atIndex:0];
+    [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:Rb offset:roff atIndex:2]; [e setBuffer:aqf_ offset:qf_off atIndex:3];
+    [e setBuffer:ascore_ offset:0 atIndex:4]; [e setBytes:&T length:4 atIndex:5]; [e setBytes:&ascale length:4 atIndex:6]; [e setBytes:&PB length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake((size_t)ch*AHEADS*T,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_smax]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBytes:&T length:4 atIndex:1];
-    [e dispatchThreadgroups:MTLSizeMake((size_t)S*AHEADS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    [e dispatchThreadgroups:MTLSizeMake((size_t)ch*AHEADS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
     [e setComputePipelineState:g_a_clat]; [e setBuffer:ascore_ offset:0 atIndex:0]; [e setBuffer:Lb offset:loff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBytes:&T length:4 atIndex:3];
-    [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
-    [e setComputePipelineState:g_a_ctx]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBuffer:actx_ offset:0 atIndex:3];
-    [e dispatchThreads:MTLSizeMake((size_t)S*AHEADS*AVH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    [e dispatchThreads:MTLSizeMake((size_t)ch*AHEADS*AKVL,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    [e setComputePipelineState:g_a_ctx]; [e setBuffer:kvbW offset:kvbwoff atIndex:0]; [e setBuffer:kvbS offset:kvbsoff atIndex:1]; [e setBuffer:aclat_ offset:0 atIndex:2]; [e setBuffer:actx_ offset:ctx_off atIndex:3];
+    [e setBytes:&kvb_fmt length:4 atIndex:4]; [e setBytes:&kvb_gs length:4 atIndex:5];
+    [e dispatchThreads:MTLSizeMake((size_t)ch*AHEADS*AVH,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; BAR();
+    return true;
+}
+// Old monolithic encode_attention: projections + core + output GEMV in one call.
+// Used by the S<=4 decode path and as a building block for larger S.
+static bool encode_attention(id<MTLComputeCommandEncoder> e, const AttnW *W,
+                             id<MTLBuffer> Lb, size_t loff, id<MTLBuffer> Rb, size_t roff,
+                             id<MTLBuffer> kvbW, size_t kvbwoff, id<MTLBuffer> kvbS, size_t kvbsoff,
+                             int S, int T, int pos_base, float eps, float theta, float ascale) {
+    if(!encode_attn_projections(e,W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta)) return false;
+    if(!encode_attn_core_chunk(e,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,0,S,T,pos_base,ascale,W->kvb_fmt,W->kvb_gs)) return false;
     bind_gemv(e,W->o_w,W->o_s,W->o_fmt,W->o_gs,AHVH,AH,actx_,aout_,S);
     return true;
 }
@@ -899,23 +973,32 @@ extern "C" int coli_metal_attn_decode(const float* x,
     const void* qa_w,const float* qa_s,int qa_fmt,int qa_gs,const float* qa_ln,
     const void* qb_w,const float* qb_s,int qb_fmt,int qb_gs,
     const void* kva_w,const float* kva_s,int kva_fmt,int kva_gs,const float* kva_ln,
-    const void* kvb_w,const float* kvb_s,int kvb_fmt,
+    const void* kvb_w,const float* kvb_s,int kvb_fmt,int kvb_gs,
     const void* o_w,const float* o_s,int o_fmt,int o_gs,
     float* Lc,float* Rc,int S,int pos_base,int st0,float eps,float theta,float ascale,float* out){
   if(!g_dev) return 0;
-  if(st0!=0 || S<1 || S>AMAXS) return 0;     // partial-KV / S>4 -> CPU
+  if(st0!=0 || S<1) return 0;     // partial-KV -> CPU (S no longer capped)
   int T=pos_base+S;
   @autoreleasepool {
     attn_scratch_init();
-    AttnW W={qa_w,qa_s,qa_fmt,qa_gs,qa_ln,qb_w,qb_s,qb_fmt,qb_gs,kva_w,kva_s,kva_fmt,kva_gs,kva_ln,kvb_w,kvb_s,kvb_fmt,o_w,o_s,o_fmt,o_gs};
+    AttnW W={qa_w,qa_s,qa_fmt,qa_gs,qa_ln,qb_w,qb_s,qb_fmt,qb_gs,kva_w,kva_s,kva_fmt,kva_gs,kva_ln,kvb_w,kvb_s,kvb_fmt,kvb_gs,o_w,o_s,o_fmt,o_gs};
     id<MTLBuffer> Lb,Rb,kvbW,kvbS; size_t loff,roff,kvbwoff,kvbsoff;
     if(!resolve_attn(&W,Lc,Rc,&Lb,&loff,&Rb,&roff,&kvbW,&kvbwoff,&kvbS,&kvbsoff)) return 0;
-    ascore_=ensure(ascore_,&ascore_cap,(size_t)S*AHEADS*T*4);
+
+    // One command buffer: projections + attention core + output GEMV in a single encoder,
+    // ordered by memory barriers — for both the S<=4 decode path and S>4 prefill. The earlier
+    // three-command-buffer split (projections/core/output as separate commit+wait buffers)
+    // corrupted cross-buffer state and forked greedy output from the first prefill token; doing
+    // it in one encoder is token-exact vs the CPU absorbed path. Guard: a single a_score dispatch
+    // is S*AHEADS*T threads — cap it under ~2^30 and fall back to CPU for giant prompts
+    // (in-encoder row-chunking to restore GPU coverage above the cap is a follow-up).
+    if((int64_t)S*AHEADS*T >= (1LL<<30)) return 0;   // too large for one dispatch -> CPU
+    attn_scratch_reserve(S,T);
     memcpy([ax_ contents],x,(size_t)S*AH*4);
     id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
     [e useResource:Lb usage:MTLResourceUsageRead|MTLResourceUsageWrite]; [e useResource:Rb usage:MTLResourceUsageRead|MTLResourceUsageWrite];
     [e useResource:kvbW usage:MTLResourceUsageRead]; [e useResource:kvbS usage:MTLResourceUsageRead];
-    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale)) return 0;
+    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,T,pos_base,eps,theta,ascale)) return 0;
     double tc=mnow();
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] attn cmdbuf error: %s\n", cb.error?[[cb.error localizedDescription]UTF8String]:"?"); return 0; }
@@ -937,7 +1020,7 @@ extern "C" int coli_metal_layer_decode(float *x,
     const void* qa_w,const float* qa_s,int qa_fmt,int qa_gs,const float* qa_ln,
     const void* qb_w,const float* qb_s,int qb_fmt,int qb_gs,
     const void* kva_w,const float* kva_s,int kva_fmt,int kva_gs,const float* kva_ln,
-    const void* kvb_w,const float* kvb_s,int kvb_fmt,
+    const void* kvb_w,const float* kvb_s,int kvb_fmt,int kvb_gs,
     const void* o_w,const float* o_s,int o_fmt,int o_gs,
     const void* shg_w,const float* shg_s,int shg_fmt,int shg_gs,
     const void* shu_w,const float* shu_s,int shu_fmt,int shu_gs,
@@ -952,7 +1035,7 @@ extern "C" int coli_metal_layer_decode(float *x,
   int T=pos_base+S; const int SI=2048;
   @autoreleasepool {
     attn_scratch_init();
-    AttnW W={qa_w,qa_s,qa_fmt,qa_gs,qa_ln,qb_w,qb_s,qb_fmt,qb_gs,kva_w,kva_s,kva_fmt,kva_gs,kva_ln,kvb_w,kvb_s,kvb_fmt,o_w,o_s,o_fmt,o_gs};
+    AttnW W={qa_w,qa_s,qa_fmt,qa_gs,qa_ln,qb_w,qb_s,qb_fmt,qb_gs,kva_w,kva_s,kva_fmt,kva_gs,kva_ln,kvb_w,kvb_s,kvb_fmt,kvb_gs,o_w,o_s,o_fmt,o_gs};
     id<MTLBuffer> Lb,Rb,kvbW,kvbS; size_t loff,roff,kvbwoff,kvbsoff;
     if(!resolve_attn(&W,Lc,Rc,&Lb,&loff,&Rb,&roff,&kvbW,&kvbwoff,&kvbS,&kvbsoff)) return 0;
     uint64_t ina=0,pna=0,rwa=0,rba=0,d;
@@ -982,7 +1065,7 @@ extern "C" int coli_metal_layer_decode(float *x,
     // 1) in_ln: ax_ = rmsnorm(x)
     copyrow(axr_,ax_,AH); BAR(); rmsw(ax_,inB,inoff,AH,S); BAR();
     // 2) attention (ax_ -> aout_)
-    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,pos_base,eps,theta,ascale)) return 0;
+    if(!encode_attention(e,&W,Lb,loff,Rb,roff,kvbW,kvbwoff,kvbS,kvbsoff,S,T,pos_base,eps,theta,ascale)) return 0;
     BAR();
     // 3) residual: axr_ += aout_ ; then nrm = post_ln(x_new)
     [e setComputePipelineState:g_a_add]; [e setBuffer:axr_ offset:0 atIndex:0]; [e setBuffer:aout_ offset:0 atIndex:1];
@@ -1138,12 +1221,12 @@ extern "C" size_t coli_metal_tensor_bytes(const ColiMetalTensor *t) { return t ?
 // if Metal is off or any expert pointer is not in a registered slab.
 // Encode + commit a MoE block (no wait). Writes hh[R,D] into hh_buf. Returns nil on
 // unresolved slab / bad fmt (caller falls back to CPU).
-static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
+static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
-  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 6)) return nil;
+  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 4 && fmt != 5 && fmt != 6)) return nil;
   if (fmt == 6) {   /* e8 kernel assumes clean block tiling, and every FWHT tile of the
                      * down input (CPU tiling rule, e8_rot_rows) must fit threadgroup mem */
     if ((D & 255) || (Iinter & 31)) return nil;
@@ -1154,6 +1237,18 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
       off += n;
     }
   }
+  // COLI_METAL_MOE_EXACT=1: route fmt=4 routed experts to the CPU reference path (bit-exact,
+  // matches matmul_i4_grouped) instead of the fast batched float4 kernel. Opt-in; default is
+  // the fast GPU path. Returning nil makes moe() fall back to CPU for fmt=4 experts, exactly
+  // like an unresolved slab -- fmt=1/2 stay on the GPU, attention/dense are untouched.
+  // (PR #587 gate-2: token-exact mode for trajectories whose gap dips under the drift tail.)
+  { static int g_moe_exact = -1;
+    if (g_moe_exact < 0) { const char *e = getenv("COLI_METAL_MOE_EXACT"); g_moe_exact = (e && e[0] && e[0] != '0'); }
+    if (g_moe_exact) return nil; }  /* exact mode is path-scoped, not fmt-scoped: the resident
+                                     * tier (fmt=1 on mixed containers) carries the same
+                                     * accumulation-order drift, so ALL routed experts fall to
+                                     * CPU under the flag (measured: 4/5 prompt flips -> 0/5,
+                                     * real g64 744B container, #587) */
   if (g_resset_enabled) {   // E5: commit any pending slab adds before we may skip useResource:
     double t0 = mnow(); resset_flush(); g_t_resset_flush += mnow() - t0;   // METAL-RESSET line
   }
@@ -1196,7 +1291,7 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
     [e setBuffer:wa offset:0 atIndex:0];[e setBuffer:sa offset:0 atIndex:1];[e setBuffer:berow offset:0 atIndex:2];
     [e setBuffer:xin offset:0 atIndex:3];[e setBuffer:y offset:0 atIndex:4];
     [e setBytes:&O length:4 atIndex:5];[e setBytes:&K length:4 atIndex:6];[e setBytes:&Kin length:4 atIndex:7];[e setBytes:&fmt length:4 atIndex:8];
-    [e setBytes:&NT length:4 atIndex:9];
+    [e setBytes:&NT length:4 atIndex:9];[e setBytes:&qgs length:4 atIndex:10];
     [e dispatchThreadgroups:MTLSizeMake(((size_t)NT+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)]; };
   gemv(bag,bsg,xg_buf,gg_buf,Iinter,D,D);                     // gate
   gemv(bau,bsu,xg_buf,uu_buf,Iinter,D,D);                     // up
@@ -1248,7 +1343,7 @@ static int moe_finish(id<MTLCommandBuffer> cb, id<MTLBuffer> hh_buf, int nb, int
   return 1;
 }
 
-extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
+extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
@@ -1261,7 +1356,7 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt,
     g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
     g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
     g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
-    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
     if (!cb) return 0;
     return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
   }
@@ -1274,7 +1369,7 @@ struct ColiMetalMoeHandle {
   std::vector<int> rows; std::vector<float> rwv;
   int nb, R, D;
 };
-extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt,
+extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fmt, int qgs,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
@@ -1286,7 +1381,7 @@ extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iin
     id<MTLBuffer> bgg=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> buu=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> bhh=[g_dev newBufferWithLength:(size_t)R*D*4 options:g_res_opts];
-    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
+    id<MTLCommandBuffer> cb = moe_submit(nb,D,Iinter,fmt,qgs,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
     if (!cb) return nullptr;
     ColiMetalMoeHandle *h = new ColiMetalMoeHandle();
     h->cb=cb; h->hh=bhh; h->rows.assign(rows,rows+R); h->rwv.assign(rw,rw+R);

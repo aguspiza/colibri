@@ -100,6 +100,7 @@ static inline int compat_open_direct(const char *path){
  * is defense-in-depth: if anyone adds a future CRT-based read path, O_BINARY
  * prevents 0x0A bytes from being silently translated to \r\n. */
 #define COMPAT_O_RDONLY (O_RDONLY | O_BINARY)
+#define COMPAT_O_BINARY O_BINARY
 
 /* --- posix_fadvise: Windows has no direct equivalent. Semantics:
  *      WILLNEED  -> warm the OS page cache so a later synchronous pread finds the
@@ -319,6 +320,12 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 }
 #define setenv(name,value,overwrite) compat_setenv(name,value,overwrite)
 
+/* --- unsetenv -> SetEnvironmentVariableA(NULL) --- */
+static inline int compat_unsetenv(const char *name){
+    return SetEnvironmentVariableA(name, NULL) ? 0 : -1;
+}
+#define unsetenv(name) compat_unsetenv(name)
+
 /* --- getenv_utf8: read an env var as UTF-8, not through the ANSI codepage ---
  * Plain getenv()/_environ are populated by the CRT from the ANSI-codepage view
  * of the process environment block, not UTF-8. A parent that hands the child a
@@ -375,6 +382,9 @@ static inline char *compat_mkdtemp(char *tmpl){
 #ifndef COMPAT_O_RDONLY
 #define COMPAT_O_RDONLY O_RDONLY
 #endif
+#ifndef COMPAT_O_BINARY
+#define COMPAT_O_BINARY 0
+#endif
 
 /* --- coli_stdin_readable: "c'e' input su stdin adesso?", senza bloccare ---
  *
@@ -417,5 +427,34 @@ static inline int coli_stdin_readable(void)
     return select(1, &r, NULL, NULL, &tv) > 0 && FD_ISSET(0, &r);
 }
 #endif
+
+/* --- coli_serve_binary_mode: stdin/stdout in BINARY per il protocollo di serve ---
+ *
+ * I motori parlano un protocollo a BYTE con `coli`:
+ *   stdout  \x01\x01READY\x01\x01\n, righe STAT, \x01\x01END\x01\x01\n
+ *   stdin   righe di testo piu' i byte di controllo \x02RESET / \x02MORE
+ * Il gateway confronta i sentinella con endswith() e una regex "^STAT ...", quindi
+ * devono arrivare ESATTI (LF, senza CR).
+ *
+ * Su Windows il CRT apre entrambi gli handle in modalita' TEXT: stdout traduce
+ * '\n' -> '\r\n' (il sentinella READY non combacia MAI e la chat si blocca senza
+ * errore), e stdin traduce '\r\n' -> '\n' e rifiuta la scrittura di byte grezzi con
+ * EINVAL, rompendo il protocollo di controllo. (#195)
+ *
+ * colibri.c lo fa da sempre; inkling.c e kimi_k3.c sono nati senza, e nessuno se n'e'
+ * accorto finche' le release binarie non hanno iniziato a contenere quei motori
+ * (#720 -> #748: Kimi K3 su Windows caricava 93 layer in 42 minuti e poi restava
+ * fermo per sempre, perche' il gateway aspettava un byte gia' storpiato).
+ * Sta QUI e non copiato in ogni motore: e' esattamente cosi' che era sparito.
+ *
+ * No-op su Linux/macOS. */
+static inline void coli_serve_binary_mode(void)
+{
+#ifdef _WIN32
+    _setmode(_fileno(stdin),  _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    setvbuf(stdout, NULL, _IONBF, 0);
+#endif
+}
 
 #endif /* COMPAT_H */

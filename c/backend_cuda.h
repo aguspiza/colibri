@@ -35,11 +35,20 @@ COLI_CUDA_DLLEXPORT int coli_cuda_device_integrated(int device);
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
+/* Per-device form of coli_cuda_group_stats; unknown devices return zeros. */
+COLI_CUDA_DLLEXPORT void coli_cuda_group_stats_device(
+    int device, uint64_t *calls, uint64_t *experts, uint64_t *rows,
+    double *h2d_ms, double *kernel_ms, double *d2h_ms);
 
 /* Publish the E8 codebook (quant.h's e8_grid, 256x4 bytes) to every configured
  * device. Must be called after coli_cuda_init and before any fmt=6 upload; the
  * backend keeps no copy of the table so it cannot drift from the CPU decoder. */
 COLI_CUDA_DLLEXPORT int coli_cuda_e8_set_grid(const void *grid);
+
+/* Publish the fmt=8 e4m3 decode table (quant.h's E4M3_LUT, 256 f32) the same
+ * way. Must be called after coli_cuda_init; fmt=8 uploads are refused until it
+ * succeeds, because kernels would decode against a zero-initialized table. */
+COLI_CUDA_DLLEXPORT int coli_cuda_fp8_set_lut(const float *lut);
 
 /* Upload without executing, so capacity failures happen during model startup. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
@@ -64,6 +73,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tens
  * The first successful call uploads W and its scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
+/* y[S,O] = x[S,I] @ dequant_mxfp4(W[O,I])^T, fmt=7 (OCP microscaling FP4).
+ * q4 is [O, ceil(I/2)] e2m1 nibbles, e8s is [O, ceil(I/32)] ue8m0 exponents --
+ * BYTES, not floats, which is why this is not folded into coli_cuda_matmul.
+ * Stateless: weights are uploaded per call, matching the streaming expert tier
+ * Kimi K3 uses. Returns 1 on success, 0 (y untouched) to fall back to CPU. */
+COLI_CUDA_DLLEXPORT int coli_cuda_matmul_mxfp4(float *y, const float *x,
+                                               const unsigned char *q4,
+                                               const unsigned char *e8s,
+                                               int S, int I, int O);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,
