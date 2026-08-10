@@ -1,17 +1,16 @@
-/* dsv4_math.h — las primitivas nuevas de DeepSeek-V4-Flash.
+/* dsv4_math.h — the primitives DeepSeek-V4-Flash adds.
  *
- * Fase 2 del port. Esto es código destinado a `c/deepseek_v4.c` en colibrì; se
- * mantiene aparte mientras se valida función a función contra el oráculo de la
- * fase 1 (`ref/oracle_tiny.py`), en vez de escribir 2.000 líneas y comparar
- * sólo los logits al final.
+ * Kept as a separate header so each function can be validated against a
+ * reference oracle one at a time, rather than writing 2,000 lines and comparing
+ * only the final logits.
  *
- * Aquí está lo que NO existe en el motor GLM de colibrì:
- *   - mHC: el stream residual [b,s,4,dim] con Sinkhorn (hc_split_sinkhorn)
- *   - el scoring sqrtsoftplus del router (GLM usa sigmoid)
- *   - SwiGLU con clamp (swiglu_limit)
+ * What follows does NOT exist in colibri's GLM engine:
+ *   - mHC: the [b,s,4,dim] residual stream with Sinkhorn (hc_split_sinkhorn)
+ *   - the router's sqrtsoftplus scoring (GLM uses sigmoid)
+ *   - SwiGLU with clamping (swiglu_limit)
  *
- * Referencia: `ref/kernel.py::hc_split_sinkhorn_kernel` (tilelang) y
- * `ref/cpu_kernel/kernel.py` (port Python verificado, 19/19 tests).
+ * Reference: DeepSeek's own hc_split_sinkhorn_kernel (tilelang) and a verified
+ * Python port of it (19/19 tests).
  */
 
 #ifndef DSV4_MATH_H
@@ -23,25 +22,25 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#define DSV4_MAX_HC 8   /* hc_mult real = 4; holgura para experimentar */
+#define DSV4_MAX_HC 8   /* real hc_mult = 4; slack for experiments */
 
 static inline float dsv4_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 /* ---------------------------------------------------------------------------
- * Redondeo a bfloat16 (round-to-nearest-even), devuelto como float.
+ * Rounding to bfloat16 (round-to-nearest-even), returned as a float.
  *
- * No es cosmética: `model.py` computa el pooling del Compressor en fp32 y luego
- * hace `self.norm(kv.to(dtype))`, o sea castea a bf16 ANTES de normalizar. Ese
- * cast es parte de la semántica del modelo, y saltárselo mete un error relativo
- * de ~1,6e-3 que se arrastra por toda la pila de capas.
+ * Not cosmetic: model.py computes the Compressor's pooling in fp32 and then does
+ * `self.norm(kv.to(dtype))`, i.e. it casts to bf16 BEFORE normalizing. That cast
+ * is part of the model's semantics, and skipping it injects a relative error of
+ * ~1.6e-3 that then propagates through the whole stack of layers.
  *
- * Regla general del port: donde la referencia cambia de precisión, el motor
- * tiene que cambiarla en el mismo sitio.
+ * The port's general rule: wherever the reference changes precision, the engine
+ * has to change it in the same place.
  * ------------------------------------------------------------------------- */
 static inline float dsv4_to_bf16(float x) {
     uint32_t u;
     memcpy(&u, &x, sizeof u);
-    if (((u >> 23) & 0xFF) == 0xFF) return x;          /* NaN/Inf intactos */
+    if (((u >> 23) & 0xFF) == 0xFF) return x;          /* NaN/Inf untouched */
     const uint32_t r = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
     float y;
     memcpy(&y, &r, sizeof y);
@@ -49,22 +48,22 @@ static inline float dsv4_to_bf16(float x) {
 }
 
 /* ---------------------------------------------------------------------------
- * Router: función de score.
+ * Router: the score function.
  *
- * GLM-5.2 usa sigmoid; DeepSeek-V4-Flash usa sqrtsoftplus. Es literalmente la
- * única diferencia del router entre las dos familias — el top-k con bias
- * (noaux_tc), la renormalización y routed_scaling_factor son idénticos.
+ * GLM-5.2 uses sigmoid; DeepSeek-V4-Flash uses sqrtsoftplus. That is literally
+ * the only difference between the two families' routers — the biased top-k
+ * (noaux_tc), the renormalization and routed_scaling_factor are identical.
  *
- * `ln(1+exp(x))` desborda a +inf para x > ~88 en f32, y de ahí salen NaN que
- * envenenan el top-k en silencio: ningún experto gana la comparación y el
- * router acaba devolviendo -1. Para x grande softplus(x) -> x, así que se corta.
+ * `ln(1+exp(x))` overflows to +inf for x > ~88 in f32, and the resulting NaNs
+ * poison the top-k silently: no expert ever wins the comparison and the router
+ * returns -1. For large x, softplus(x) -> x, so it is cut off there.
  * ------------------------------------------------------------------------- */
 static inline float dsv4_sqrtsoftplus(float x) {
     return sqrtf(x > 20.0f ? x : log1pf(expf(x)));
 }
 
 /* ---------------------------------------------------------------------------
- * RMSNorm — igual que en el resto de colibrì, aquí por completitud.
+ * RMSNorm — same as everywhere else in colibri, here for completeness.
  * ------------------------------------------------------------------------- */
 static inline void dsv4_rmsnorm(float *out, const float *x, const float *w,
                                 int n, float eps) {
@@ -75,18 +74,18 @@ static inline void dsv4_rmsnorm(float *out, const float *x, const float *w,
 }
 
 /* ---------------------------------------------------------------------------
- * SwiGLU con clamp (`swiglu_limit: 10.0`).
- * `kimi_k3.c` ya tiene una variante acotada (`situf_`), pero con otra fórmula:
- * esta es la de DeepSeek, un recorte duro antes de la puerta.
+ * SwiGLU with clamping (`swiglu_limit: 10.0`).
+ * kimi_k3.c already has a bounded variant (`situf_`) but with a different
+ * formula: this is DeepSeek's, a hard clip before the gate.
  * ------------------------------------------------------------------------- */
 static inline float dsv4_swiglu(float gate, float up, float limit) {
     if (limit > 0.0f) {
-        /* ASIMÉTRICO, y es a propósito (`model.py::Expert.forward`):
-         *   up   = clamp(up, min=-limit, max=limit)   -> por los dos lados
-         *   gate = clamp(gate, max=limit)             -> SÓLO por arriba
-         * Recortar también `gate` por abajo parece lo natural y es incorrecto:
-         * SiLU ya satura hacia -inf, así que el límite inferior no hace falta y
-         * ponerlo cambia la función. */
+        /* ASYMMETRIC, and deliberately so (model.py::Expert.forward):
+         *   up   = clamp(up, min=-limit, max=limit)   -> both sides
+         *   gate = clamp(gate, max=limit)             -> UPPER bound ONLY
+         * Clipping `gate` from below as well looks like the natural thing to do
+         * and is wrong: SiLU already saturates towards -inf, so the lower bound
+         * is unnecessary and adding it changes the function. */
         if (gate > limit) gate = limit;
         if (up   >  limit) up   =  limit;
         if (up   < -limit) up   = -limit;
@@ -97,20 +96,20 @@ static inline float dsv4_swiglu(float gate, float up, float limit) {
 /* ---------------------------------------------------------------------------
  * mHC — hc_split_sinkhorn.
  *
- * Descompone mixes[(2+hc)*hc] en (pre, post, comb):
+ * Splits mixes[(2+hc)*hc] into (pre, post, comb):
  *
  *   [0    : hc  ] -> pre  = sigmoid(m*scale[0] + base) + eps
  *   [hc   : 2*hc] -> post = 2*sigmoid(m*scale[1] + base)
- *   [2*hc :     ] -> comb = (m*scale[2] + base) como matriz [hc,hc]
+ *   [2*hc :     ] -> comb = (m*scale[2] + base) as an [hc,hc] matrix
  *
- * y comb pasa por: softmax por filas, +eps, normalizar columnas, y luego
- * (iters-1) rondas de (normalizar filas, normalizar columnas). El resultado
- * tiende a doblemente estocástica.
+ * and comb then goes through: row softmax, +eps, column normalization, and then
+ * (iters-1) rounds of (normalize rows, normalize columns). The result tends
+ * towards doubly stochastic.
  *
- * OJO con el conteo de iteraciones: la primera ronda es la del softmax, NO una
- * iteración completa. Poner `iters` rondas en vez de `iters-1` es un error que
- * no rompe nada visiblemente —comb sigue siendo casi doblemente estocástica—
- * pero desvía los números lo justo para que la fase 4 no cuadre.
+ * MIND THE ITERATION COUNT: the first round is the softmax one, NOT a full
+ * iteration. Running `iters` rounds instead of `iters-1` is a mistake that breaks
+ * nothing visibly — comb stays very nearly doubly stochastic — but shifts the
+ * numbers just enough that later validation stops matching.
  * ------------------------------------------------------------------------- */
 static inline void dsv4_hc_split_sinkhorn(
         const float *mixes,      /* [(2+hc)*hc] */
@@ -131,7 +130,7 @@ static inline void dsv4_hc_split_sinkhorn(
     for (int i = 0; i < hc * hc; i++)
         comb[i] = mixes[off + i] * hc_scale[2] + hc_base[off + i];
 
-    /* softmax por filas (estable: se resta el máximo), luego +eps */
+    /* row softmax (stable: the max is subtracted), then +eps */
     for (int r = 0; r < hc; r++) {
         float *row = comb + (size_t)r * hc;
         float mx = row[0];
@@ -144,7 +143,7 @@ static inline void dsv4_hc_split_sinkhorn(
 
     float acc[DSV4_MAX_HC];
 
-    /* normalizar columnas */
+    /* normalize columns */
     for (int c = 0; c < hc; c++) {
         float s = 0.0f;
         for (int r = 0; r < hc; r++) s += comb[(size_t)r * hc + c];
@@ -171,7 +170,7 @@ static inline void dsv4_hc_split_sinkhorn(
 }
 
 /* ---------------------------------------------------------------------------
- * mHC — colapsar las `hc` copias del residual en la entrada de la sub-capa.
+ * mHC — collapse the residual's `hc` copies into the sub-layer's input.
  *   x[d] = sum_m pre[m] * h[m][d]
  * ------------------------------------------------------------------------- */
 static inline void dsv4_hc_collapse(float *x, const float *h, const float *pre,
@@ -185,11 +184,11 @@ static inline void dsv4_hc_collapse(float *x, const float *h, const float *pre,
 }
 
 /* ---------------------------------------------------------------------------
- * mHC — reexpandir a `hc` copias tras la sub-capa.
+ * mHC — re-expand into `hc` copies after the sub-layer.
  *   h[m][d] = post[m]*y[d] + sum_n comb[m][n]*hres[n][d]
  *
- * `hres` es el residual de ENTRADA a la sub-capa; `h` puede ser el mismo
- * buffer sólo si no se solapan, así que se exige que sean distintos.
+ * `hres` is the residual that went INTO the sub-layer; `h` may only alias it if
+ * they do not overlap, so callers are required to keep them distinct.
  * ------------------------------------------------------------------------- */
 static inline void dsv4_hc_expand(float *h, const float *y, const float *post,
                                   const float *comb, const float *hres,
@@ -198,15 +197,15 @@ static inline void dsv4_hc_expand(float *h, const float *y, const float *post,
         float *dst = h + (size_t)j * dim;
         const float pj = post[j];
         for (int d = 0; d < dim; d++) dst[d] = pj * y[d];
-        /* comb va TRANSPUESTA: la salida j acumula sobre la primera dimensión.
+        /* comb is used TRANSPOSED: output j accumulates over the first index.
          *
-         * `model.py::hc_post` hace
+         * model.py::hc_post computes
          *     sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-         * que desarrollado es  y[j] = sum_i comb[i][j] * residual[i]  — no
-         * `sum_j comb[i][j]`, que es lo natural de escribir y lo que yo tenía.
-         * Como `comb` sale doblemente estocástica del Sinkhorn, filas y
-         * columnas suman 1 y el error es casi invisible en las métricas
-         * agregadas: sólo se ve encadenando el bloque entero. */
+         * which expands to  y[j] = sum_i comb[i][j] * residual[i]  — not
+         * `sum_j comb[i][j]`, which is the natural thing to write and what this
+         * code had at first. Because Sinkhorn leaves `comb` doubly stochastic,
+         * rows and columns both sum to 1 and the error is nearly invisible in
+         * aggregate metrics: it only shows up once the whole block is chained. */
         for (int i = 0; i < hc; i++) {
             const float c = comb[(size_t)i * hc + j];
             const float *src = hres + (size_t)i * dim;
@@ -216,35 +215,35 @@ static inline void dsv4_hc_expand(float *h, const float *y, const float *post,
 }
 
 /* ---------------------------------------------------------------------------
- * CSA — pooling con puerta aprendida del `Compressor` (prefill).
+ * CSA — the `Compressor`'s learned-gate pooling (prefill).
  *
- * Es la operación central de Compressed Sparse Attention: funde `ratio` tokens
- * consecutivos en uno solo, ponderándolos con una puerta aprendida:
+ * This is the central operation of Compressed Sparse Attention: it fuses `ratio`
+ * consecutive tokens into one, weighting them with a learned gate:
  *
  *     kv = (kv * (score + ape).softmax(dim=slot)).sum(dim=slot)
  *
- * Tres cosas que hay que entender o los números no salen:
+ * Three things have to be understood or the numbers do not come out:
  *
- *   1. **El softmax es POR CANAL, no escalar.** `score` tiene la misma forma
- *      que `kv`, así que cada canal `c` decide su propia mezcla sobre los
- *      slots. No es "pesar tokens", es "pesar tokens por cada dimensión".
+ *   1. THE SOFTMAX IS PER CHANNEL, not scalar. `score` has the same shape as
+ *      `kv`, so every channel `c` decides its own mixture over the slots. It is
+ *      not "weighting tokens", it is "weighting tokens per dimension".
  *
- *   2. **`ape` es un embedding de posición DENTRO del bloque** ([ratio, coff*d]),
- *      y se suma al score antes del softmax. Por eso el compressor distingue el
- *      primer token de un grupo del último.
+ *   2. `ape` IS A POSITION EMBEDDING WITHIN THE BLOCK ([ratio, coff*d]), added to
+ *      the score before the softmax. That is how the compressor tells a group's
+ *      first token from its last.
  *
- *   3. **Modo solapado** (`overlap`, que es cuando compress_ratio == 4): las
- *      proyecciones sacan 2*d canales y cada grupo atiende a 2*ratio slots —
- *      la mitad alta de los canales del propio grupo, y la mitad baja del grupo
- *      ANTERIOR. Así los bordes entre bloques no cortan en seco. El primer
- *      grupo no tiene anterior: sus slots bajos van a 0 con score -inf, que
- *      tras el softmax pesan exactamente 0.
+ *   3. OVERLAP MODE (`overlap`, which is when compress_ratio == 4): the
+ *      projections emit 2*d channels and each group attends to 2*ratio slots —
+ *      the upper half of the channels from its own group, the lower half from the
+ *      PREVIOUS group. That way block boundaries do not cut abruptly. The first
+ *      group has no predecessor: its low slots are zeroed with score -inf, which
+ *      after the softmax weigh exactly 0.
  *
- * Sólo cubre el camino de prefill (start_pos == 0) sin resto (seqlen múltiplo
- * de ratio). El camino de decode incremental usa `kv_state`/`score_state` y va
- * aparte.
+ * Only covers the prefill path (start_pos == 0) with no remainder (seqlen a
+ * multiple of ratio). The incremental decode path uses `kv_state`/`score_state`
+ * and lives in dsv4_decode.h.
  *
- *   kv, score : [b, s, coff*d]   con coff = overlap ? 2 : 1
+ *   kv, score : [b, s, coff*d]   with coff = overlap ? 2 : 1
  *   ape       : [ratio, coff*d]
  *   out       : [b, s/ratio, d]
  * ------------------------------------------------------------------------- */
@@ -254,7 +253,7 @@ static inline void dsv4_compress_prefill(
         float *out)
 {
     const int coff  = overlap ? 2 : 1;
-    const int chan  = coff * d;              /* canales de kv/score/ape */
+    const int chan  = coff * d;              /* kv/score/ape channels */
     const int nslot = overlap ? 2 * ratio : ratio;
     const int ngrp  = s / ratio;
 
@@ -267,7 +266,7 @@ static inline void dsv4_compress_prefill(
             float *dst = out + ((size_t)bi * ngrp + g) * d;
 
             for (int c = 0; c < d; c++) {
-                /* reunir (peso, valor) de cada slot para este canal */
+                /* gather (weight, value) from each slot for this channel */
                 for (int j = 0; j < nslot; j++) {
                     int t, ch;
                     if (!overlap) {
@@ -277,7 +276,7 @@ static inline void dsv4_compress_prefill(
                         t = g * ratio + (j - ratio);
                         ch = d + c;              /* mitad alta: grupo propio */
                     } else if (g == 0) {
-                        w[j] = -INFINITY;        /* no hay grupo anterior */
+                        w[j] = -INFINITY;        /* no previous group */
                         v[j] = 0.0f;
                         continue;
                     } else {
@@ -285,12 +284,12 @@ static inline void dsv4_compress_prefill(
                         ch = c;                  /* mitad baja: grupo anterior */
                     }
                     const size_t idx = ((size_t)bi * s + t) * chan + ch;
-                    /* ape se indexa por la posición DENTRO del bloque */
+                    /* ape is indexed by the position WITHIN the block */
                     w[j] = score[idx] + ape[(size_t)(t % ratio) * chan + ch];
                     v[j] = kv[idx];
                 }
 
-                /* softmax estable sobre los slots + suma ponderada */
+                /* stable softmax over the slots + weighted sum */
                 float mx = -INFINITY;
                 for (int j = 0; j < nslot; j++) if (w[j] > mx) mx = w[j];
                 float sum = 0.0f;
@@ -311,56 +310,56 @@ static inline void dsv4_compress_prefill(
 }
 
 /* ---------------------------------------------------------------------------
- * Indexer: puntuar la KV comprimida y quedarse con las `keep` mejores.
+ * Indexer: score the compressed KV and keep the best `keep` entries.
  *
- * BUENA NOTICIA PARA EL PORT: esto es, función a función, el mismo scoring que
- * el indexer DSA que colibrì ya tiene para GLM-5.2 (`colibri.c:3374-3382`):
+ * GOOD NEWS FOR THE PORT: function for function, this is the same scoring as the
+ * DSA indexer colibri already has for GLM-5.2:
  *
  *     d0 = dot(q_h, k_t) * rs;
- *     if (d0 > 0) a += w32[h] * d0;      // ReLU y LUEGO el peso por cabeza
+ *     if (d0 > 0) a += w32[h] * d0;      // ReLU and THEN the per-head weight
  *     isc[t] = a * wsc;                  // wsc = 1/sqrt(n_heads)
  *
- * y DeepSeek-V4-Flash hace exactamente lo mismo:
+ * and DeepSeek-V4-Flash does exactly the same:
  *
  *     index_score = (einsum("bshd,btd->bsht", q, kv).relu_()
  *                    * weights.unsqueeze(-1)).sum(dim=2)
  *     weights = weights_proj(x) * (softmax_scale * n_heads**-0.5)
  *
- * (Como rs > 0, relu(d0*rs) == rs*relu(d0): da igual dónde se aplique la
- * escala.) Kimi K3 no tiene nada de esto — usa KDA, una recurrencia delta-rule
- * sin selección.
+ * (Since rs > 0, relu(d0*rs) == rs*relu(d0): it does not matter where the scale
+ * is applied.) Kimi K3 has none of this — it uses KDA, a delta-rule recurrence
+ * with no selection.
  *
- * Las diferencias reales frente a GLM son tres, y ninguna toca esta función:
- *   1. V4 puntúa contra la KV **comprimida** (la que llena el Compressor propio
- *      del indexer); GLM contra la KV latente completa.
- *   2. El `q` de V4 pasa por rotación Hadamard + simulación FP4.
- *   3. GLM normaliza las claves con un `k_norm` (LayerNorm); en V4 esa función
- *      la hace el `norm` del compressor del indexer.
+ * There are three real differences from GLM, and none of them touches this
+ * function:
+ *   1. V4 scores against the COMPRESSED KV (the one the indexer's own Compressor
+ *      fills); GLM scores against the full latent KV.
+ *   2. V4's `q` goes through a Hadamard rotation + FP4 simulation.
+ *   3. GLM normalizes the keys with a `k_norm` (LayerNorm); in V4 that job is
+ *      done by the `norm` of the indexer's compressor.
  *
- * PRECISIÓN: el scoring corre en **bfloat16**, no en f32, y aquí eso no es un
- * detalle cosmético. Calcularlo en f32 da un orden distinto —y con `index_topk`
- * menor que el número de bloques comprimidos, un CONJUNTO distinto— o sea que
- * la atención acabaría mirando a otras posiciones. Medido: con f32 fallaban
- * 2/512 índices del modelo tiny; con bf16, 0.
+ * PRECISION: the scoring runs in BFLOAT16, not f32, and here that is not a
+ * cosmetic detail. Computing it in f32 yields a different order — and, when
+ * `index_topk` is smaller than the number of compressed blocks, a different SET —
+ * so attention would end up looking at different positions. Measured: in f32,
+ * 2/512 of the tiny model's indices were wrong; in bf16, none.
  *
- * Se reproduce acumulando en f32 y redondeando a bf16 en cada frontera de
- * tensor (salida del einsum, el peso escalado, la suma sobre cabezas), que es
- * lo que hace torch con tensores bf16. Verificado contra la referencia nativa.
+ * It is reproduced by accumulating in f32 and rounding to bf16 at every tensor
+ * boundary (the einsum's output, the scaled weight, the sum over heads), which is
+ * what torch does with bf16 tensors. Verified against the native reference.
  *
- * Aquí la selección es O(keep · T) por claridad. En producción se usa
- * `partial_select_desc` de colibrì (quickselect O(T) medio) con el mismo
- * criterio de desempate.
+ * The selection here is O(keep * T) for clarity. Production uses colibri's
+ * `partial_select_desc` (quickselect, O(T) average) with the same tie-break.
  *
- *   q       : [b, s, h, d]   ya rotado y cuantizado
- *   kv      : [b, Tcap, d]   KV comprimida; sólo valen las `nvalid` primeras
- *   weights : [b, s, h]      salida CRUDA de weights_proj (la escala va aquí)
- *   out     : [b, s, keep]   índices, o -1 para relleno no causal
+ *   q       : [b, s, h, d]   already rotated and quantized
+ *   kv      : [b, Tcap, d]   compressed KV; only the first `nvalid` are valid
+ *   weights : [b, s, h]      the RAW weights_proj output (the scale goes here)
+ *   out     : [b, s, keep]   indices, or -1 for non-causal padding
  * ------------------------------------------------------------------------- */
 static inline void dsv4_indexer_topk_ex(
         const float *q, const float *kv, const float *weights,
         int b, int s, int h, int d, int Tcap, int nvalid,
         int ratio, int keep, int offset, float softmax_scale,
-        int no_causal,   /* 1 = sin máscara: todo lo comprimido es pasado */
+        int no_causal,   /* 1 = no mask: everything compressed is past */
         int *out)
 {
     const float wsc = softmax_scale / sqrtf((float)h);
@@ -370,13 +369,13 @@ static inline void dsv4_indexer_topk_ex(
 
     for (int bi = 0; bi < b; bi++) {
         for (int si = 0; si < s; si++) {
-            /* Límite causal: una posición sólo puede mirar bloques comprimidos
-             * ya cerrados. Para las primeras `ratio-1` posiciones esto es 0, o
-             * sea que NADA es visible y la fila entera sale a -1.
+            /* Causal limit: a position may only look at compressed blocks that
+             * are already closed. For the first `ratio-1` positions that is 0,
+             * i.e. NOTHING is visible and the whole row comes out -1.
              *
-             * En DECODE no aplica: todo lo comprimido es pasado por
-             * construcción. Intentar desactivarlo pasando ratio=1 no funciona
-             * —da limit=1 y recorta a un solo bloque—, hace falta el flag. */
+             * In DECODE it does not apply: everything compressed is past by
+             * construction. Trying to disable it by passing ratio=1 does not work
+             * — that gives limit=1 and clips to a single block — hence the flag. */
             const int limit = no_causal ? nvalid : (si + 1) / ratio;
 
             for (int t = 0; t < nvalid; t++) {
@@ -387,12 +386,12 @@ static inline void dsv4_indexer_topk_ex(
                     const float *kt = kv + ((size_t)bi * Tcap + t) * d;
                     float dot = 0.0f;
                     for (int i = 0; i < d; i++) dot += qh[i] * kt[i];
-                    dot = dsv4_to_bf16(dot);              /* salida del einsum */
+                    dot = dsv4_to_bf16(dot);              /* the einsum's output */
                     if (dot > 0.0f) {                     /* ReLU */
                         const float wh = dsv4_to_bf16(
                                 weights[((size_t)bi * s + si) * h + hi] * wsc);
-                        /* el PRODUCTO se redondea antes de acumular: la suma
-                         * sobre cabezas va en f32 y se redondea al final */
+                        /* the PRODUCT is rounded before accumulating: the sum
+                         * over heads runs in f32 and is rounded at the end */
                         a += dsv4_to_bf16(wh * dot);
                     }
                 }
@@ -400,7 +399,7 @@ static inline void dsv4_indexer_topk_ex(
                 taken[t] = 0;
             }
 
-            /* selección: mayor score primero, empates por índice menor */
+            /* selection: highest score first, ties broken by lower index */
             int *dst = out + ((size_t)bi * s + si) * keep;
             for (int k = 0; k < keep; k++) {
                 int best = -1;
@@ -410,8 +409,8 @@ static inline void dsv4_indexer_topk_ex(
                 }
                 if (best < 0) { dst[k] = -1; continue; }
                 taken[best] = 1;
-                /* lo que cae fuera del límite causal es relleno, no una
-                 * posición: se marca -1 y `sparse_attn` lo ignora. */
+                /* anything past the causal limit is padding, not a position:
+                 * it is marked -1 and `sparse_attn` skips it. */
                 dst[k] = (best >= limit) ? -1 : best + offset;
             }
         }
@@ -421,7 +420,7 @@ static inline void dsv4_indexer_topk_ex(
     free(taken);
 }
 
-/* Envoltorio con máscara causal: el camino de prefill, ya validado. */
+/* Wrapper with the causal mask: the prefill path, already validated. */
 static inline void dsv4_indexer_topk(
         const float *q, const float *kv, const float *weights,
         int b, int s, int h, int d, int Tcap, int nvalid,
@@ -432,24 +431,24 @@ static inline void dsv4_indexer_topk(
 }
 
 /* ---------------------------------------------------------------------------
- * sparse_attn — atención sobre las posiciones que eligió el indexer.
+ * sparse_attn — attention over the positions the indexer selected.
  *
- * Port de `ref/kernel.py::sparse_attn_kernel`. Tres detalles que hay que
- * respetar o los números no cuadran:
+ * A port of DeepSeek's sparse_attn_kernel. Three details have to be respected or
+ * the numbers do not add up:
  *
- *   1. **`kv` hace de K y de V a la vez** ([b,n,d], una sola cabeza: el config
- *      dice `num_key_value_heads: 1`). Es atención MLA absorbida — no hay
- *      proyección V separada.
- *   2. **Los índices -1 son relleno** y se enmascaran a -inf, no a cero.
- *   3. **`attn_sink` va SÓLO en el denominador**: `sum_exp += exp(sink - max)`.
- *      Es un sumidero por cabeza —un "token nulo" aprendido— que deja a una
- *      cabeza no atender a nada. Sumarlo también al numerador es el error fácil
- *      y silencioso: la salida seguiría pareciendo razonable.
+ *   1. `kv` SERVES AS BOTH K AND V ([b,n,d], a single head: the config says
+ *      `num_key_value_heads: 1`). This is absorbed MLA attention — there is no
+ *      separate V projection.
+ *   2. INDICES OF -1 ARE PADDING and are masked to -inf, not to zero.
+ *   3. `attn_sink` GOES IN THE DENOMINATOR ONLY: `sum_exp += exp(sink - max)`.
+ *      It is a per-head sink — a learned "null token" — that lets a head attend
+ *      to nothing. Adding it to the numerator as well is the easy, silent
+ *      mistake: the output would still look plausible.
  *
  *   q    : [b, m, h, d]
  *   kv   : [b, n, d]
  *   sink : [h]
- *   idxs : [b, m, topk]   con -1 como relleno
+ *   idxs : [b, m, topk]   with -1 as padding
  *   out  : [b, m, h, d]
  * ------------------------------------------------------------------------- */
 static inline void dsv4_sparse_attn(
@@ -476,8 +475,8 @@ static inline void dsv4_sparse_attn(
                     e[k] = dot * softmax_scale;
                     if (e[k] > mx) mx = e[k];
                 }
-                /* Si no hay ninguna posición válida, el máximo se queda a 0
-                 * (como hace el kernel) y sólo pesa el sumidero. */
+                /* If no position is valid, the max stays 0 (as the kernel does)
+                 * and only the sink carries any weight. */
                 if (mx == -INFINITY) mx = 0.0f;
 
                 float denom = 0.0f;
@@ -485,7 +484,7 @@ static inline void dsv4_sparse_attn(
                     e[k] = (e[k] == -INFINITY) ? 0.0f : expf(e[k] - mx);
                     denom += e[k];
                 }
-                denom += expf(sink[hi] - mx);     /* sólo en el denominador */
+                denom += expf(sink[hi] - mx);     /* denominator only */
 
                 float *o = out + (((size_t)bi * m + mi) * h + hi) * d;
                 for (int i = 0; i < d; i++) o[i] = 0.0f;
@@ -506,20 +505,20 @@ static inline void dsv4_sparse_attn(
 }
 
 /* ---------------------------------------------------------------------------
- * RoPE — rotación posicional sobre los últimos `rd` canales.
+ * RoPE — positional rotation over the last `rd` channels.
  *
- * `model.py` la aplica IN-PLACE y en formato **entrelazado**: los canales se
- * leen por pares consecutivos (x0,x1) como un complejo, no partiendo el vector
- * por la mitad. Es el mismo convenio que `rope_interleave` en `colibri.c`.
+ * model.py applies it IN-PLACE and INTERLEAVED: the channels are read as
+ * consecutive pairs (x0,x1) treated as one complex number, not by splitting the
+ * vector in half. Same convention as `rope_interleave` in colibri.c.
  *
  *   (x0, x1) * (c, s) = (x0*c - x1*s,  x0*s + x1*c)
  *
- * `inverse` usa el conjugado (des-rotar). Hace falta de verdad: la salida de la
- * atención pasa por una RoPE inversa antes de la proyección de salida
- * (`model.py:539`), cosa fácil de pasar por alto.
+ * `inverse` uses the conjugate (un-rotate). It really is needed: the attention
+ * output goes through an inverse RoPE before the output projection, which is easy
+ * to overlook.
  *
- *   x     : [..., rows, (heads,) rd]  se rota in-place
- *   freqs : [rows, rd/2, 2]           (real, imag) por posición y par
+ *   x     : [..., rows, (heads,) rd]  rotated in place
+ *   freqs : [rows, rd/2, 2]           (real, imag) per position and pair
  * ------------------------------------------------------------------------- */
 static inline void dsv4_rope(float *x, const float *freqs, int outer, int rows,
                              int heads, int rd, int inverse) {
@@ -533,12 +532,12 @@ static inline void dsv4_rope(float *x, const float *freqs, int outer, int rows,
                     const float s0 = freqs[((size_t)r * pairs + p) * 2 + 1];
                     const float s = inverse ? -s0 : s0;
                     const float a = v[2 * p], b = v[2 * p + 1];
-                    /* `apply_rotary_emb` calcula en complejo f32 pero hace
-                     * `y.copy_(x)` sobre el tensor ORIGINAL, que es bf16: el
-                     * resultado queda redondeado. Sin esto la RoPE se queda a
-                     * 1,6e-3 en vez de ser exacta, y el error se amplifica al
-                     * cuantizar después a FP4 (los valores cruzan de punto de
-                     * la rejilla e2m1). */
+                    /* `apply_rotary_emb` computes in complex f32 but then does
+                     * `y.copy_(x)` onto the ORIGINAL tensor, which is bf16: the
+                     * result ends up rounded. Without this the RoPE sits at
+                     * 1.6e-3 instead of being exact, and the error is amplified
+                     * by the later FP4 quantization (values cross to a different
+                     * point on the e2m1 grid). */
                     v[2 * p]     = dsv4_to_bf16(a * c - b * s);
                     v[2 * p + 1] = dsv4_to_bf16(a * s + b * c);
                 }
@@ -548,39 +547,39 @@ static inline void dsv4_rope(float *x, const float *freqs, int outer, int rows,
 }
 
 /* ---------------------------------------------------------------------------
- * act_quant FP8 (e4m3) por bloques, fusionado quant+dequant.
+ * Blockwise FP8 (e4m3) act_quant, with quant+dequant fused.
  *
- * `model.py` lo aplica in-place sobre los canales NO-rope de la KV para simular
- * el QAT: los valores vuelven a bf16 pero ya con la pérdida de FP8. Los canales
- * rope se dejan intactos, que ahí la precisión posicional importa.
+ * model.py applies it in place over the KV's NON-rope channels to simulate QAT:
+ * the values come back as bf16 but already carrying FP8's loss. The rope channels
+ * are left untouched, since positional precision matters there.
  *
- * Con `pow2` (scale_fmt="ue8m0") la escala se redondea a potencia de dos hacia
- * arriba — es lo que hace el formato MXFP y lo que trae el checkpoint.
+ * With `pow2` (scale_fmt="ue8m0") the scale is rounded up to a power of two —
+ * which is what the MXFP format does and what the checkpoint ships.
  * ------------------------------------------------------------------------- */
 #define DSV4_FP8_MAX 448.0f
 
 static inline float dsv4_quant_e4m3(float v) {
-    /* e4m3: 4 bits de exponente, 3 de mantisa, sin infinitos.
-     * Se redondea al representable más cercano vía escalado por potencia de 2. */
+    /* e4m3: 4 exponent bits, 3 mantissa bits, no infinities.
+     * Rounded to the nearest representable via power-of-two scaling. */
     if (v == 0.0f || !isfinite(v)) return v;
     const float a = fabsf(v);
     if (a > DSV4_FP8_MAX) return v > 0 ? DSV4_FP8_MAX : -DSV4_FP8_MAX;
     int ex;
     frexpf(a, &ex);                       /* a = m * 2^ex, m en [0.5,1) */
-    if (ex < -5) ex = -5;                 /* rango subnormal de e4m3 */
-    const float step = ldexpf(1.0f, ex - 4);   /* 3 bits de mantisa + implícito */
-    /* nearbyintf, NO roundf: el hardware FP8 redondea al par más cercano
-     * (round-to-nearest-even) y `roundf` redondea las medias hacia afuera. Sólo
-     * se nota en los empates exactos, pero ahí falla: un valor que cae en 8,5
-     * pasos sale 2,25 en vez de 2,0. Medido contra la referencia. */
+    if (ex < -5) ex = -5;                 /* e4m3's subnormal range */
+    const float step = ldexpf(1.0f, ex - 4);   /* 3 mantissa bits + implicit */
+    /* nearbyintf, NOT roundf: FP8 hardware rounds to nearest even and `roundf`
+     * rounds halves away from zero. It only shows up on exact ties, but there it
+     * is wrong: a value landing on 8.5 steps comes out 2.25 instead of 2.0.
+     * Measured against the reference. */
     float q = nearbyintf(v / step) * step;
     if (q > DSV4_FP8_MAX) q = DSV4_FP8_MAX;
     if (q < -DSV4_FP8_MAX) q = -DSV4_FP8_MAX;
     return q;
 }
 
-/* FP4 e2m1: sólo 8 magnitudes representables. La rejilla se recorre entera
- * porque son 8 comparaciones; no compensa nada más listo. */
+/* FP4 e2m1: only 8 representable magnitudes. The grid is scanned in full because
+ * that is 8 comparisons; nothing cleverer is worth it. */
 #define DSV4_FP4_MAX 6.0f
 
 static inline float dsv4_quant_e2m1(float v) {
@@ -596,12 +595,12 @@ static inline float dsv4_quant_e2m1(float v) {
 
 typedef enum { DSV4_FP8 = 0, DSV4_FP4 = 1 } DsV4QuantFmt;
 
-/* Cuantización por bloques fusionada quant+dequant, in-place.
+/* Blockwise quant+dequant, fused, in place.
  *
- * FP8 y FP4 comparten TODO menos la rejilla de redondeo y el máximo del
- * formato: mismo amax por bloque, misma escala redondeada a potencia de dos
- * (ue8m0), mismo reescalado. Tenerlas separadas invitaba a que una recibiera
- * una corrección y la otra no. */
+ * FP8 and FP4 share EVERYTHING except the rounding grid and the format's maximum:
+ * same per-block amax, same scale rounded up to a power of two (ue8m0), same
+ * rescale. Keeping them as separate functions invited one of them getting a fix
+ * the other did not. */
 static inline void dsv4_blockwise_quant(float *x, int64_t rows, int n,
                                         int block, int pow2, DsV4QuantFmt fmt) {
     const float vmax = (fmt == DSV4_FP4) ? DSV4_FP4_MAX : DSV4_FP8_MAX;
@@ -638,14 +637,14 @@ static inline void dsv4_act_quant_inplace(float *x, int64_t rows, int n,
 }
 
 /* ---------------------------------------------------------------------------
- * Transformada de Walsh-Hadamard sobre la última dimensión, escalada 1/sqrt(n).
+ * Walsh-Hadamard transform over the last dimension, scaled by 1/sqrt(n).
  *
- * `model.py::rotate_activation` la usa para repartir la información entre
- * dimensiones antes de cuantizar a FP4/FP8. Es ORTOGONAL, así que rotar q y k a
- * la vez no cambia sus productos escalares: existe sólo para que la
- * cuantización se porte mejor, no para alterar la atención.
+ * model.py::rotate_activation uses it to spread information across dimensions
+ * before quantizing to FP4/FP8. It is ORTHOGONAL, so rotating q and k together
+ * leaves their dot products unchanged: it exists only to make quantization behave
+ * better, not to alter attention.
  *
- * Mariposa iterativa in-place. `n` debe ser potencia de dos (lo es: 128, 256).
+ * Iterative in-place butterfly. `n` must be a power of two (it is: 128, 256).
  * ------------------------------------------------------------------------- */
 static inline void dsv4_hadamard(float *x, int64_t rows, int n) {
     const float scale = 1.0f / sqrtf((float)n);
@@ -665,17 +664,17 @@ static inline void dsv4_hadamard(float *x, int64_t rows, int n) {
 }
 
 /* ---------------------------------------------------------------------------
- * Compressor completo (prefill): pooling con puerta -> bf16 -> RMSNorm ->
- * RoPE -> simulación de cuantización.
+ * The complete Compressor (prefill): gated pooling -> bf16 -> RMSNorm -> RoPE ->
+ * simulated quantization.
  *
- * El detalle que se escapa leyendo por encima: la RoPE de la KV comprimida usa
- * las frecuencias **submuestreadas cada `ratio`** (`freqs_cis[:cutoff:ratio]`),
- * porque cada entrada comprimida representa un bloque de `ratio` tokens y su
- * posición es la del primer token del bloque. Usar `freqs[g]` en vez de
+ * The detail that a quick read misses: the compressed KV's RoPE uses the
+ * frequencies SUBSAMPLED EVERY `ratio` (`freqs_cis[:cutoff:ratio]`), because each
+ * compressed entry stands for a block of `ratio` tokens and its position is that
+ * of the block's first token. Using `freqs[g]` instead of
  * `freqs[g*ratio]` da un resultado plausible pero equivocado.
  *
- * `rotate` distingue los dos compressors: el del Indexer rota con Hadamard y
- * cuantiza a FP4 el vector entero; el principal cuantiza a FP8 sólo los canales
+ * `rotate` tells the two compressors apart: the Indexer's rotates with Hadamard
+ * and quantizes the whole vector to FP4; the main one quantizes to FP8 only the
  * no-rope.
  *
  *   out : [b, s/ratio, d]
@@ -691,7 +690,7 @@ static inline void dsv4_compress_forward(
 
     dsv4_compress_prefill(kv_in, score, ape, b, s, ratio, d, overlap, out);
 
-    /* `model.py` hace `self.norm(kv.to(dtype))`: bf16 ANTES de normalizar */
+    /* model.py does `self.norm(kv.to(dtype))`: bf16 BEFORE normalizing */
     for (int64_t i = 0; i < rows * d; i++) out[i] = dsv4_to_bf16(out[i]);
 
     float *tmp = (float *)malloc((size_t)d * sizeof(float));
@@ -701,8 +700,8 @@ static inline void dsv4_compress_forward(
     }
     free(tmp);
 
-    /* RoPE con frecuencias submuestreadas: el grupo g está en la posición
-     * g*ratio de la secuencia original. */
+    /* RoPE with subsampled frequencies: group g sits at position g*ratio of the
+     * original sequence. */
     for (int64_t r = 0; r < rows; r++) {
         const int g = (int)(r % ngrp);
         dsv4_rope(out + r * d + (d - rd),
@@ -711,12 +710,12 @@ static inline void dsv4_compress_forward(
     }
 
     if (rotate) {
-        /* Compressor del Indexer: Hadamard y FP4 sobre el vector entero */
+        /* The Indexer's Compressor: Hadamard and FP4 over the whole vector */
         dsv4_hadamard(out, rows, d);
         dsv4_blockwise_quant(out, rows, d, 32, 1, DSV4_FP4);
     } else {
-        /* Compressor principal: FP8 sólo en los canales no-rope. Hay que
-         * compactarlos porque no son contiguos entre filas. */
+        /* Main Compressor: FP8 on the non-rope channels only. They have to be
+         * compacted first because they are not contiguous across rows. */
         const int nrope = d - rd;
         float *t2 = (float *)malloc((size_t)rows * nrope * sizeof(float));
         for (int64_t r = 0; r < rows; r++)
@@ -729,20 +728,20 @@ static inline void dsv4_compress_forward(
 }
 
 /* ---------------------------------------------------------------------------
- * freqs_cis con escalado YaRN.
+ * freqs_cis with YaRN scaling.
  *
- * Port de `model.py::precompute_freqs_cis`. YaRN extiende el contexto sin
- * reentrenar: en vez de dividir TODAS las frecuencias por `factor` —lo que
- * estropearía las de periodo corto, que codifican posición local— interpola
- * sólo las de periodo largo, con una rampa lineal entre dos "rangos de
- * corrección" derivados de beta_fast y beta_slow.
+ * A port of model.py::precompute_freqs_cis. YaRN extends the context without
+ * retraining: instead of dividing ALL frequencies by `factor` — which would ruin
+ * the short-period ones that encode local position — it interpolates only the
+ * long-period ones, with a linear ramp between two "correction ranges" derived
+ * from beta_fast and beta_slow.
  *
- * DeepSeek-V4-Flash: base 10000, factor 16, original 65536 -> 1M de contexto.
- * Y hay una SEGUNDA tabla con base 160000 (`compress_rope_theta`) para la KV
- * comprimida, porque sus posiciones avanzan de `ratio` en `ratio` y necesitan
- * otra escala de frecuencias.
+ * DeepSeek-V4-Flash: base 10000, factor 16, original 65536 -> 1M of context. And
+ * there is a SECOND table with base 160000 (`compress_rope_theta`) for the
+ * compressed KV, because its positions advance in steps of `ratio` and need a
+ * different frequency scale.
  *
- *   out : [seqlen, dim/2, 2]  con (cos, sin) por posición y par
+ *   out : [seqlen, dim/2, 2]  with (cos, sin) per position and pair
  * ------------------------------------------------------------------------- */
 static inline void dsv4_precompute_freqs(float *out, int dim, int seqlen,
                                          int original_seq_len, double base,
@@ -773,7 +772,7 @@ static inline void dsv4_precompute_freqs(float *out, int dim, int seqlen,
             if (ramp < 0) ramp = 0;
             if (ramp > 1) ramp = 1;
             const double smooth = 1.0 - ramp;
-            /* las de periodo corto (smooth~1) se quedan; las largas se dividen */
+            /* short-period ones (smooth~1) are kept; long ones get divided */
             freqs[i] = freqs[i] / factor * (1.0 - smooth) + freqs[i] * smooth;
         }
     }
