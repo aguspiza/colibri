@@ -671,7 +671,7 @@ static inline void dsv4_hadamard(float *x, int64_t rows, int n) {
  * frequencies SUBSAMPLED EVERY `ratio` (`freqs_cis[:cutoff:ratio]`), because each
  * compressed entry stands for a block of `ratio` tokens and its position is that
  * of the block's first token. Using `freqs[g]` instead of
- * `freqs[g*ratio]` da un resultado plausible pero equivocado.
+ * `freqs[g*ratio]` gives a plausible but wrong result.
  *
  * `rotate` tells the two compressors apart: the Indexer's rotates with Hadamard
  * and quantizes the whole vector to FP4; the main one quantizes to FP8 only the
@@ -756,8 +756,8 @@ static inline void dsv4_precompute_freqs(float *out, int dim, int seqlen,
         freqs[i] = 1.0 / pow(base, (double)(2 * i) / (double)dim);
 
     if (original_seq_len > 0) {
-        /* find_correction_range(beta_fast, beta_slow, ...): qué dimensiones
-         * necesitan interpolarse y cuáles se dejan intactas. */
+        /* find_correction_range(beta_fast, beta_slow, ...): which dimensions
+         * need interpolating and which are left untouched. */
         const double c = (double)dim / (2.0 * log(base));
         double lo = floor(c * log((double)original_seq_len /
                                   (beta_fast * 2.0 * M_PI)));

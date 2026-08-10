@@ -268,7 +268,7 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
         tk_use = tkc;
     }
 
-    /* --- atención dispersa ---------------------------------------------- */
+    /* --- sparse attention ----------------------------------------------- */
     dsv4_sparse_attn(q, kv_cat, w->attn_sink, tk_use, b, s, c->heads, c->hd,
                      n_kv, ntk, c->scale, o);
 

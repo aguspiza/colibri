@@ -149,7 +149,7 @@ static inline int dsv4_compress_decode_st(float *ks_all, float *ss_all,
         ss[(size_t)slot * chan + c] = score[c] + ape[(size_t)r * chan + c];
     }
 
-    if ((start_pos + 1) % ratio != 0) return 0;      /* bloque aún abierto */
+    if ((start_pos + 1) % ratio != 0) return 0;      /* block still open */
 
     /* Gated pooling over the slots. With overlap, the LOW channels come from the
      * previous block and the HIGH ones from the current block — the same split
@@ -260,7 +260,7 @@ static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
                kv + (size_t)bi * c->hd, (size_t)c->hd * sizeof(float));
     }
 
-    /* --- compresión incremental --- */
+    /* --- incremental compression --- */
     int ncomp_avail = 0;
     if (c->ratio) {
         const int coff = st->coff;

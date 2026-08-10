@@ -1,22 +1,24 @@
-/* deepseek_v4.c — el motor: carga el checkpoint de 284B y genera texto.
+/* dsv4_port.c — the independent port's engine: loads the 284B checkpoint and
+ * generates text. See docs/deepseek-v4-port.md; c/deepseek_v4.c is the
+ * production V4 engine and this is a parallel implementation.
  *
- * Monta las primitivas ya validadas (dsv4_*.h) a escala real: 43 capas, 72.317
- * tensores, 156 GiB en disco.
+ * Assembles the already-validated primitives (dsv4_*.h) at full scale: 43 layers,
+ * 72,317 tensors, 156 GiB on disk.
  *
- * REPARTO DE MEMORIA, que es la decisión de diseño central:
+ * THE MEMORY SPLIT, which is the central design decision:
  *
- *   residente en RAM   8,67 GiB   atención, normas, routers, expertos
- *                                 compartidos, embeddings y lm_head — EN SU
- *                                 FORMATO NATIVO, sin dequantizar
- *   por streaming    137,1 GiB   los 11.008 expertos rutados, leídos del NVMe
- *                                 cuando el router los pide, con caché LRU
+ *   resident in RAM    8.67 GiB   attention, norms, routers, shared experts,
+ *                                 embeddings and lm_head — IN THEIR NATIVE
+ *                                 FORMAT, not dequantized
+ *   streamed         137.1 GiB    the 11,008 routed experts, read off the NVMe
+ *                                 when the router asks for them, with an LRU
  *
- * Dequantizar el denso a f32 serían 26,8 GiB y no cabría; con descriptores
- * (`dsv4_weight.h`) el matmul lee el formato original y nunca materializa la
- * matriz. Es la misma decisión que toma colibrì con su struct `QT`.
+ * Dequantizing the dense set to f32 would be 26.8 GiB and would not fit; with
+ * descriptors (dsv4_weight.h) the matmul reads the original format and never
+ * materializes the matrix. Same decision colibri makes with its `QT` struct.
  *
  * Build:  make -C port engine
- * Uso:    ./deepseek_v4 <dir_modelo> "prompt" [n_tokens]
+ * Usage:  ./dsv4_port <model_dir> "prompt" [n_tokens]
  */
 
 #include <stdio.h>
@@ -38,7 +40,7 @@
 #include "quant.h"
 #include "tok.h"
 
-#include "omp_tune.h"   /* squadra sui core fisici: ver la nota en main() */
+#include "omp_tune.h"   /* team sized to physical cores: see the note in main() */
 
 #include "dsv4_fp8.h"
 #include "dsv4_weight.h"
@@ -56,58 +58,57 @@ static double now_s(void) {
 #endif
 }
 
-/* Perfil: dónde se va el tiempo. Antes de optimizar, medir. */
+/* Profiling: where the time goes. Measure before optimizing. */
 static double g_t_attn, g_t_moe, g_t_io, g_t_head;
 static uint64_t g_pf_batches, g_pf_reads, g_fb_bytes;
-static uint8_t g_seen[(43 * 256 + 7) / 8];   /* capas x expertos, 1 bit cada uno */
+static uint8_t g_seen[(43 * 256 + 7) / 8];   /* layers x experts, one bit each */
 static uint64_t g_distinct;
-static FILE *g_trace;   /* DSV4_TRACE=fichero -> vuelca (token,capa,experto) */
+static FILE *g_trace;   /* DSV4_TRACE=file -> dumps (token,layer,expert) */
 static int g_tok_no;
-/* `cap` de la pasarela: en colibrì significa slots de caché POR CAPA, no en
- * total. Se multiplica por n_layers al construir el tier. */
+/* The gateway's `cap`: in colibri this means cache slots PER LAYER, not in
+ * total. It is multiplied by n_layers when the tier is built. */
 static int g_cache_per_layer;
 
 /* ---------------------------------------------------------------------------
- * Política de carga, al estilo del `--load-mode` de llama.cpp.
+ * Load policy, in the style of llama.cpp's `--load-mode`.
  *
- * Hay dos poblaciones de pesos con regímenes OPUESTOS, y por eso no vale una
- * respuesta única:
+ * There are two populations of weights with OPPOSITE access regimes, which is why
+ * no single answer works:
  *
- *   denso, 8,67 GB   se lee en CADA token. Sus páginas fallan una vez y se
- *                    quedan residentes para siempre -> mapear gana: la carga
- *                    es perezosa y no se duplican 8,67 GB entre el montón y la
- *                    caché de páginas.
- *   expertos, 137 GB cada región se toca una vez y se descarta -> mapear
- *                    PIERDE. Medido: 23,7 s frente a 18,9. Los buffers de los
- *                    slots se reutilizan y sus páginas no vuelven a fallar,
- *                    mientras que el mapeo falla en cada región nueva: 13,4 MB
- *                    por experto son ~3.400 fallos de 4 KB. Cambiar un memcpy
- *                    por 3.400 entradas al kernel no sale a cuenta.
+ *   dense, 8.67 GB   read on EVERY token. Its pages fault once and stay resident
+ *                    forever -> mapping wins: loading is lazy and 8.67 GB is not
+ *                    duplicated between the heap and the page cache.
+ *   experts, 137 GB  each region is touched once and discarded -> mapping LOSES.
+ *                    Measured: 23.7 s against 18.9. The slot buffers are reused
+ *                    and their pages never fault again, whereas the mapping
+ *                    faults on every new region: 13.4 MB per expert is ~3,400
+ *                    faults of 4 KB. Trading a memcpy for 3,400 kernel entries
+ *                    is not worth it.
  *
- * Mapear no sale gratis pero compra MEMORIA PRIVADA, que es lo que de verdad
- * limita a quién le cabe el modelo. Medido con 14 tokens:
+ * Mapping is not free, but it buys PRIVATE MEMORY, which is what actually decides
+ * who the model fits for. Measured over 14 tokens:
  *
- *   DSV4_LOAD   privado   working set   tiempo
- *   read         13,2 GB      13,2 GB    19,3 s   <- por defecto, lo más rápido
- *   dense         5,4 GB      12,2 GB    21,5 s   +11 %, -7,8 GB privados
- *   all           0,6 GB      24,7 GB    24,4 s   +26 %, corre en casi nada
+ *   DSV4_LOAD   private   working set   time
+ *   read        13.2 GB       13.2 GB   19.3 s   <- default, the fastest
+ *   dense        5.4 GB       12.2 GB   21.5 s   +11 %, -7.8 GB private
+ *   all          0.6 GB       24.7 GB   24.4 s   +26 %, runs in almost nothing
  *
- * Lo que compra `dense` no es memoria libre —el working set apenas baja— sino
- * que esos 8,67 GB pasan de anónimos a respaldados por fichero: bajo presión el
- * SO los DESCARTA en vez de mandarlos al swap. `all` lleva al proceso a 0,6 GB
- * privados a cambio de llenar el working set y de un 26 % de tiempo.
+ * What `dense` buys is not free memory — the working set barely moves — it is
+ * that those 8.67 GB go from anonymous to file-backed: under pressure the OS
+ * DISCARDS them instead of pushing them to swap. `all` takes the process down to
+ * 0.6 GB private in exchange for filling the working set and 26 % of the time.
  *
- * Es la misma razón por la que llama.cpp mantiene `--load-mode` en vez de
- * elegir por ti: no hay una respuesta buena para todas las máquinas.
+ * Same reason llama.cpp keeps `--load-mode` instead of choosing for you: there is
+ * no good answer for every machine.
  * ------------------------------------------------------------------------- */
 typedef enum { LOAD_READ = 0, LOAD_DENSE = 1, LOAD_ALL = 2 } LoadMode;
 
 static LoadMode load_mode(void) {
     const char *s = getenv("DSV4_LOAD");
-    if (!s || !strcmp(s, "read")) return LOAD_READ;      /* por defecto */
+    if (!s || !strcmp(s, "read")) return LOAD_READ;      /* the default */
     if (!strcmp(s, "dense")) return LOAD_DENSE;
     if (!strcmp(s, "all"))   return LOAD_ALL;
-    fprintf(stderr, "DSV4_LOAD debe ser read|dense|all\n");
+    fprintf(stderr, "DSV4_LOAD must be read|dense|all\n");
     exit(1);
 }
 
@@ -119,7 +120,7 @@ static uint8_t *map_file(const char *path, uint64_t *len) {
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); return NULL; }
     HANDLE m = CreateFileMappingA(h, NULL, PAGE_READONLY, 0, 0, NULL);
-    CloseHandle(h);                      /* la vista mantiene vivo el fichero */
+    CloseHandle(h);                      /* the view keeps the file alive */
     if (!m) return NULL;
     void *p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
     CloseHandle(m);
@@ -142,8 +143,8 @@ static uint8_t *map_file(const char *path, uint64_t *len) {
 }
 #endif
 
-/* Los shards mapeados. Es seguro apuntar el kernel a offsets arbitrarios:
- * `quant.h` no usa ni una carga alineada, sólo `loadu` (49 de 49). */
+/* The mapped shards. Pointing the kernel at arbitrary offsets is safe:
+ * quant.h does not use a single aligned load, only `loadu` (49 of 49). */
 static uint8_t **g_smap;
 
 static void smap_init(shards *S) {
@@ -152,43 +153,42 @@ static void smap_init(shards *S) {
         uint64_t len = 0;
         g_smap[i] = map_file(S->paths[i], &len);
         if (!g_smap[i]) {
-            fprintf(stderr, "no pude mapear %s; se cargara leyendo\n", S->paths[i]);
+            fprintf(stderr, "could not map %s; falling back to reads\n", S->paths[i]);
             free(g_smap); g_smap = NULL;
             return;
         }
     }
 }
 
-/* Puntero al tensor dentro del mapeo, o NULL si no hay mapeo. */
+/* Pointer to the tensor inside the mapping, or NULL if there is no mapping. */
 static uint8_t *smap_ptr(shards *S, const char *nm) {
     if (!g_smap) return NULL;
     st_tensor *t = st_find(S, nm);
-    if (!t) { fprintf(stderr, "falta %s\n", nm); exit(1); }
+    if (!t) { fprintf(stderr, "missing %s\n", nm); exit(1); }
     for (int i = 0; i < S->nfd; i++)
         if (S->fds[i] == t->fd) return g_smap[i] + t->off;
     return NULL;
 }
 
 /* ---------------------------------------------------------------------------
- * Tier de expertos por streaming.
+ * The streaming expert tier.
  *
- * Un experto son 3 matrices MXFP4 + sus escalas = 13,4 MB. No caben los 11.008
- * (137 GiB), así que se leen bajo demanda de los shards y se guardan en una
- * caché LRU por capa. Los offsets se resuelven una vez al cargar: en decode no
- * se busca por nombre, se hace `pread` a un offset conocido.
+ * One expert is 3 MXFP4 matrices plus their scales = 13.4 MB. All 11,008 do not
+ * fit (137 GiB), so they are read from the shards on demand and held in an LRU
+ * cache. The offsets are resolved once at load time: in decode nothing is looked
+ * up by name, it is a `pread` to a known offset.
  * ------------------------------------------------------------------------- */
 typedef struct {
     uint8_t *buf[6];        /* w1,w1s, w2,w2s, w3,w3s */
     int layer, expert;
     uint64_t used;
-    int pending;            /* lecturas en vuelo; 0 = listo para usar */
+    int pending;            /* reads in flight; 0 = ready to use */
 } ExpSlot;
 
-/* Un trabajo de lectura: un tensor de un experto en un slot. */
+/* One read job: one tensor of one expert into one slot. */
 typedef struct { int slot, layer, expert, k; } RdJob;
 
-/* Un tensor de experto, ya resuelto: sin buscar por nombre en el camino
- * caliente. */
+/* An expert tensor, already resolved: no name lookups on the hot path. */
 typedef struct { int shard; int64_t off, nb; } ExpTensor;
 
 typedef struct {
@@ -199,26 +199,26 @@ typedef struct {
     int nslot;
     uint64_t clock, hits, miss;
     uint64_t bytes;
-    int mapped;             /* LOAD_ALL: sin buffers ni LRU, se lee del mapeo */
+    int mapped;             /* LOAD_ALL: no buffers, no LRU, read from the map */
 
     /* UN DESCRIPTOR POR HILO Y SHARD.
      *
-     * En Windows, las ReadFile concurrentes sobre un handle abierto en modo
-     * síncrono las serializa el propio SO sobre el objeto fichero, aunque se
-     * les pase un OVERLAPPED. Medido en este equipo: lecturas dispersas en frío
-     * dan 1,06 GB/s con un hilo y 2,9 GB/s con cuatro *si cada uno tiene su
-     * propio descriptor* — compartiéndolo se quedan en el ritmo de uno solo.
-     * Era el motivo de que paralelizar el prefetch no cambiase nada. */
+     * On Windows, concurrent ReadFile calls on a handle opened in synchronous
+     * mode are serialized by the OS itself on the file object, even when an
+     * OVERLAPPED is supplied. Measured on this host: cold scattered reads give
+     * 1.06 GB/s with one thread and 2.9 GB/s with four *if each has its own
+     * descriptor* — sharing one keeps them at a single reader's rate. This was
+     * why parallelizing the prefetch changed nothing. */
     int nthreads, nshard;
     int *fd;                /* [thread * nshard + shard] */
 
     /* POOL PERSISTENTE DE LECTORES.
      *
-     * `tier_prefetch` encola y vuelve; el MoE se pone a calcular el primer
-     * experto mientras los demás siguen llegando. Antes bloqueaba hasta tener
-     * los seis, así que los 4,3 s de cómputo y los 12,2 de I/O iban en serie.
-     * También quita el montaje y desmontaje de una región OpenMP por capa y
-     * token, que eran 602 en una generación de 14. */
+     * `tier_prefetch` enqueues and returns; the MoE starts computing the first
+     * expert while the rest are still arriving. It used to block until all six
+     * had landed, so the 4.3 s of compute and the 12.2 s of I/O ran in series.
+     * It also removes the setup and teardown of one OpenMP region per layer per
+     * token — 602 of them in a 14-token run. */
     RdJob *q;
     int qcap, qhead, qtail;
     pthread_mutex_t mu;
@@ -236,12 +236,12 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
     T->S = S; T->n_layers = n_layers; T->n_experts = n_experts;
     T->inter = inter; T->dim = dim; T->cap = cap;
     T->mapped = (load_mode() == LOAD_ALL && g_smap != NULL);
-    if (T->mapped) cap = T->cap = 1;   /* la caché la lleva el SO */
+    if (T->mapped) cap = T->cap = 1;   /* the OS owns the cache */
     T->slots = calloc((size_t)cap, sizeof(ExpSlot));
     for (int i = 0; i < cap; i++) { T->slots[i].layer = -1; T->slots[i].expert = -1; }
 
-    /* Resuelve los 66.048 tensores de una vez: en decode no se busca por
-     * nombre, se hace pread a un offset ya conocido. */
+    /* Resolve all 66,048 tensors up front: in decode nothing is looked up by
+     * name, it is a pread to an offset that is already known. */
     T->tens = malloc((size_t)n_layers * n_experts * 6 * sizeof(ExpTensor));
     static const char *mats[3] = { "w1", "w2", "w3" };
     for (int l = 0; l < n_layers; l++)
@@ -252,15 +252,15 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
                     snprintf(nm, sizeof nm, "layers.%d.ffn.experts.%d.%s.%s",
                              l, e, mats[k], which ? "scale" : "weight");
                     st_tensor *t = st_find(S, nm);
-                    if (!t) { fprintf(stderr, "falta %s\n", nm); exit(1); }
+                    if (!t) { fprintf(stderr, "missing %s\n", nm); exit(1); }
                     ExpTensor *d = &T->tens[((size_t)l * n_experts + e) * 6 + k * 2 + which];
                     d->off = t->off; d->nb = t->nbytes; d->shard = -1;
                     for (int i = 0; i < S->nfd; i++)
                         if (S->fds[i] == t->fd) { d->shard = i; break; }
-                    if (d->shard < 0) { fprintf(stderr, "shard de %s?\n", nm); exit(1); }
+                    if (d->shard < 0) { fprintf(stderr, "which shard is %s in?\n", nm); exit(1); }
                 }
 
-    /* Un descriptor por hilo y shard: ver el comentario de la struct. */
+    /* One descriptor per thread and shard: see the struct comment. */
 #ifdef _OPENMP
     T->nthreads = omp_get_max_threads();
 #else
@@ -276,7 +276,7 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
     tier_pool_start(T);
 }
 
-/* Busca el experto en la caché; -1 si no está. */
+/* Look the expert up in the cache; -1 if it is not there. */
 static int tier_find(const ExpertTier *T, int layer, int e)
 {
     for (int i = 0; i < T->nslot; i++)
@@ -284,32 +284,32 @@ static int tier_find(const ExpertTier *T, int layer, int e)
     return -1;
 }
 
-/* Reserva un slot por LRU y lo marca como recién usado, de forma que una
- * reserva posterior DENTRO DE LA MISMA TANDA no pueda expulsarlo. */
+/* Reserve a slot by LRU and mark it just-used, so that a later reservation
+ * WITHIN THE SAME BATCH cannot evict it. */
 static int tier_reserve(ExpertTier *T)
 {
     int v;
     if (T->nslot < T->cap) v = T->nslot++;
     else {
-        /* Un slot con lecturas EN VUELO no se puede expulsar: los workers están
-         * escribiendo en sus buffers. Como mucho hay `topk` a la vez y la caché
-         * tiene cientos, así que saltárselos nunca deja al LRU sin candidato. */
+        /* A slot with reads IN FLIGHT cannot be evicted: the workers are writing
+         * into its buffers. At most `topk` are in flight and the cache holds
+         * hundreds, so skipping them never leaves the LRU without a candidate. */
         v = -1;
         for (int i = 0; i < T->nslot; i++) {
             if (T->slots[i].pending) continue;
             if (v < 0 || T->slots[i].used < T->slots[v].used) v = i;
         }
-        if (v < 0) { fprintf(stderr, "cache demasiado pequena: todo en vuelo\n"); exit(1); }
+        if (v < 0) { fprintf(stderr, "cache too small: everything is in flight\n"); exit(1); }
     }
     T->slots[v].used = ++T->clock;
     return v;
 }
 
-/* Reserva los buffers de los 6 tensores de un experto y anota los bytes. No
- * lee: la lectura se reparte aparte, ver `tier_prefetch`. */
-/* Todos los expertos tienen la misma forma, así que los buffers se reservan una
- * vez por slot y no se vuelven a tocar: el `realloc` estaba en la parte SERIE
- * de cada tanda de prefetch, 19 veces por capa y por token. */
+/* Allocate the buffers for an expert's 6 tensors and account the bytes. Does not
+ * read: the reads are dispatched separately, see `tier_prefetch`. */
+/* Every expert has the same shape, so the buffers are allocated once per slot and
+ * never touched again: the `realloc` used to sit in the SERIAL part of every
+ * prefetch batch, 19 times per layer per token. */
 static void tier_alloc(ExpertTier *T, int slot, int layer, int e)
 {
     ExpSlot *s = &T->slots[slot];
@@ -321,10 +321,10 @@ static void tier_alloc(ExpertTier *T, int slot, int layer, int e)
     s->layer = layer; s->expert = e;
 }
 
-/* Lee un tensor suelto por el descriptor DEL HILO que llama.
+/* Read a single tensor through the CALLING THREAD's descriptor.
  *
- * Sin estado compartido: cada hilo usa su propio fd y escribe en un buffer
- * distinto. Sólo `pending` se toca bajo el mutex, en el bucle del worker. */
+ * No shared state: each thread uses its own fd and writes into a different
+ * buffer. Only `pending` is touched under the mutex, in the worker loop. */
 static void tier_read_one(ExpertTier *T, int slot, int layer, int e, int k, int tid)
 {
     const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6 + k];
@@ -333,13 +333,13 @@ static void tier_read_one(ExpertTier *T, int slot, int layer, int e, int k, int 
     int64_t done = 0;
     while (done < d->nb) {
         const ssize_t got = pread(fd, out + done, (size_t)(d->nb - done), d->off + done);
-        if (got <= 0) { fprintf(stderr, "pread corto en capa %d experto %d\n", layer, e); exit(1); }
+        if (got <= 0) { fprintf(stderr, "short pread at layer %d expert %d\n", layer, e); exit(1); }
         done += got;
     }
 }
 
-/* Un worker: saca trabajos de la cola hasta que le dicen que pare. Su índice
- * es también el índice de su juego de descriptores. */
+/* A worker: pulls jobs off the queue until told to stop. Its index is also the
+ * index of its own set of descriptors. */
 typedef struct { ExpertTier *T; int tid; } RdArg;
 
 static void *tier_worker(void *arg)
@@ -374,13 +374,13 @@ static void tier_pool_start(ExpertTier *T)
     pthread_cond_init(&T->cv_done, NULL);
     T->th = malloc((size_t)T->nthreads * sizeof(pthread_t));
     for (int i = 0; i < T->nthreads; i++) {
-        RdArg *a = malloc(sizeof *a);   /* lo conserva el hilo */
+        RdArg *a = malloc(sizeof *a);   /* the thread keeps it */
         a->T = T; a->tid = i;
         pthread_create(&T->th[i], NULL, tier_worker, a);
     }
 }
 
-/* Encola las 6 lecturas de un experto. Con el mutex ya tomado. */
+/* Enqueue an expert's 6 reads. Called with the mutex already held. */
 static void tier_submit(ExpertTier *T, int slot, int layer, int e)
 {
     T->slots[slot].pending = 6;
@@ -391,30 +391,31 @@ static void tier_submit(ExpertTier *T, int slot, int layer, int e)
     pthread_cond_broadcast(&T->cv_job);
 }
 
-/* Espera a que un slot tenga sus 6 tensores. */
+/* Wait until a slot has all 6 of its tensors. */
 static void tier_wait(ExpertTier *T, int slot)
 {
     const double t0 = now_s();
     pthread_mutex_lock(&T->mu);
     while (T->slots[slot].pending) pthread_cond_wait(&T->cv_done, &T->mu);
     pthread_mutex_unlock(&T->mu);
-    g_t_io += now_s() - t0;   /* ahora mide ESPERA, no lectura: es lo que cuesta */
+    g_t_io += now_s() - t0;   /* now measures WAITING, not reading: that is the cost */
 }
 
-/* Trae de golpe los `n` expertos que el router acaba de elegir.
+/* Fetch, in one go, the `n` experts the router has just chosen.
  *
- * Es la diferencia entre profundidad de cola 1 y n: un NVMe da su ancho de
- * banda con varias lecturas en vuelo, y de una en una se queda en la latencia.
- * La reserva de slots va en serie —el LRU es estado global— y sólo las lecturas
- * se reparten. */
+ * This is the difference between queue depth 1 and n: an NVMe only gives its
+ * bandwidth with several reads in flight, and one at a time it is latency-bound.
+ * Slot reservation stays serial — the LRU is global state — and only the reads
+ * are spread out. */
 static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
 {
     int slot[16], want[16], nw = 0;
     if (n > 16) n = 16;
     if (T->mapped) {
-        /* Se le PIDE al SO que traiga los rangos, sin tocarlos: tocarlos
-         * costaría el mismo ancho de banda que leerlos. Es una pista, no una
-         * garantía; si la página no ha llegado, el fallo se resuelve al leer. */
+        /* The OS is ASKED to bring the ranges in, without touching them:
+         * touching them would cost the same bandwidth as reading them. It is a
+         * hint, not a guarantee; if a page has not arrived, the fault resolves at
+         * read time. */
 #ifdef _WIN32
         WIN32_MEMORY_RANGE_ENTRY r[16 * 6];
         int nr = 0;
@@ -444,9 +445,9 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
         const int f = tier_find(T, layer, es[k]);
         if (f >= 0) { T->hits++; T->slots[f].used = ++T->clock; continue; }
         T->miss++;
-        /* Cuántos expertos DISTINTOS pide la generación entera: es el número de
-         * fallos que tendría una caché infinita, o sea el techo de lo que puede
-         * dar agrandar ésta. Si ya estamos cerca, crecer no sirve de nada. */
+        /* How many DISTINCT experts the whole run asks for: that is the miss
+         * count an infinite cache would have, i.e. the ceiling on what growing
+         * this one can buy. If we are already close, growing it is pointless. */
         {   const size_t bit = (size_t)layer * T->n_experts + es[k];
             if (!(g_seen[bit >> 3] & (1u << (bit & 7)))) {
                 g_seen[bit >> 3] |= (uint8_t)(1u << (bit & 7));
@@ -460,23 +461,23 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
     if (!nw) return;
     g_pf_batches++; g_pf_reads += (uint64_t)nw;
 
-    /* Se encola y se vuelve. Se reparte por TENSOR y no por experto: con ~3,2
-     * expertos por tanda, un trabajo por experto dejaría la cola del NVMe a
-     * profundidad 3,2 en vez de 19. */
+    /* Enqueue and return. The split is PER TENSOR, not per expert: at ~3.2
+     * experts per batch, one job per expert would leave the NVMe queue at depth
+     * 3.2 instead of 19. */
     for (int j = 0; j < nw; j++) tier_alloc(T, slot[j], layer, want[j]);
     pthread_mutex_lock(&T->mu);
     for (int j = 0; j < nw; j++) tier_submit(T, slot[j], layer, want[j]);
     pthread_mutex_unlock(&T->mu);
 }
 
-/* Devuelve los descriptores del experto. Tras `tier_prefetch` siempre acierta;
- * el camino de carga queda como red de seguridad para quien no lo use. */
+/* Returns the expert's descriptors. After `tier_prefetch` this always hits; the
+ * loading path stays as a safety net for callers that do not prefetch. */
 static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4W *w3)
 {
     if (T->mapped) {
-        /* Sin copia y sin caché propia: los descriptores apuntan a la página y
-         * la caché es la del SO. Cuesta ~25 % más tiempo (fallos de página por
-         * cada 4 KB de región nueva) y ahorra los GB de los buffers. */
+        /* No copy and no cache of our own: the descriptors point at the page and
+         * the cache is the OS's. Costs ~25 % more time (a page fault per 4 KB of
+         * new region) and saves the buffers' gigabytes. */
         const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6];
         uint8_t *p[6];
         for (int k = 0; k < 6; k++) {
@@ -500,7 +501,7 @@ static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4
         pthread_mutex_unlock(&T->mu);
         g_fb_bytes += T->bytes - b0;
     }
-    tier_wait(T, hit);   /* tras el prefetch suele volver sin bloquear */
+    tier_wait(T, hit);   /* after a prefetch this usually returns immediately */
 
     ExpSlot *s = &T->slots[hit];
     s->used = ++T->clock;
@@ -509,7 +510,7 @@ static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4
     *w3 = dsv4_w_mxfp4(s->buf[4], s->buf[5], T->inter, T->dim);
 }
 
-/* Adaptador: el MoE pide expertos por callback y no sabe nada de shards. */
+/* Adapter: the MoE asks for experts by callback and knows nothing about shards. */
 static void tier_fetch(void *ctx, int layer, int e,
                        DsV4W *w1, DsV4W *w2, DsV4W *w3) {
     tier_get((ExpertTier *)ctx, layer, e, w1, w2, w3);
@@ -527,13 +528,13 @@ typedef struct {
     ExpertTier tier;
 
     int n_layers, dim, vocab, hc, n_hash, sinkhorn_iters;
-    int bos, eos;           /* del config.json: 0 y 1 en este checkpoint */
+    int bos, eos;           /* from config.json: 0 and 1 in this checkpoint */
     float norm_eps, hc_eps;
     int *ratios;
 
     DsV4BlockCfg *cfg;      /* [n_layers] */
     DsV4BlockW   *w;        /* [n_layers] */
-    int32_t *tid2eid;       /* [vocab * topk], sólo si hay capas hash */
+    int32_t *tid2eid;       /* [vocab * topk], only when there are hash layers */
 
     DsV4W embed, head;
     const float *final_norm, *hc_head_fn, *hc_head_base, *hc_head_scale;
@@ -541,7 +542,7 @@ typedef struct {
     int max_seq;
 } Model;
 
-/* --- helpers de carga --------------------------------------------------- */
+/* --- load helpers ------------------------------------------------------- */
 static void *raw_of(shards *S, const char *nm) {
     const int64_t n = st_nbytes(S, nm);
     void *p = malloc((size_t)n);
@@ -551,7 +552,7 @@ static void *raw_of(shards *S, const char *nm) {
 static float *vec_f32(shards *S, const char *nm, int n) {
     float *out = malloc((size_t)n * sizeof(float));
     st_tensor *t = st_find(S, nm);
-    if (!t) { fprintf(stderr, "falta %s\n", nm); exit(1); }
+    if (!t) { fprintf(stderr, "missing %s\n", nm); exit(1); }
     if (t->dtype == 2) { st_read_f32(S, nm, out, 0); return out; }   /* F32 */
     uint8_t *r = raw_of(S, nm);                                       /* BF16 */
     DsV4W v = dsv4_w_bf16(r, 1, n);
@@ -559,10 +560,11 @@ static float *vec_f32(shards *S, const char *nm, int n) {
     free(r);
     return out;
 }
-/* Matriz cuantizada: FP8 si tiene .scale, BF16 si no.
+/* A quantized matrix: FP8 when it has a .scale, BF16 otherwise.
  *
- * Es el grueso del conjunto denso (atención, embed, lm_head, compartidos), y
- * sale del mapeo cuando lo hay: no se copia nada y la carga es perezosa. */
+ * This is the bulk of the dense set (attention, embed, lm_head, shared experts),
+ * and it comes from the mapping when there is one: nothing is copied and loading
+ * is lazy. */
 static DsV4W mat_of(shards *S, const char *base, int O, int I) {
     char nw[192], ns[192];
     snprintf(nw, sizeof nw, "%s.weight", base);
@@ -587,10 +589,10 @@ static void model_load(Model *M, const char *dir) {
     char cfgp[1024];
     snprintf(cfgp, sizeof cfgp, "%s/config.json", dir);
     FILE *f = fopen(cfgp, "rb");
-    if (!f) { fprintf(stderr, "no encuentro %s\n", cfgp); exit(1); }
+    if (!f) { fprintf(stderr, "cannot find %s\n", cfgp); exit(1); }
     fseek(f, 0, SEEK_END); long cn = ftell(f); fseek(f, 0, SEEK_SET);
     char *cbuf = malloc((size_t)cn + 1);
-    if (fread(cbuf, 1, (size_t)cn, f) != (size_t)cn) { fprintf(stderr, "config corto\n"); exit(1); }
+    if (fread(cbuf, 1, (size_t)cn, f) != (size_t)cn) { fprintf(stderr, "config truncated\n"); exit(1); }
     cbuf[cn] = 0; fclose(f);
     char *arena = NULL;
     jval *C = json_parse(cbuf, &arena);
@@ -627,13 +629,13 @@ static void model_load(Model *M, const char *dir) {
 #undef GI
 #undef GF
 
-    /* Los diagnosticos van a stderr SIEMPRE: en modo serve, stdout es el
-     * protocolo, y una linea suelta ahi descoloca a la pasarela. */
-    fprintf(stderr, "config: %d capas, dim %d, %d cabezas x %d, %d expertos top-%d\n",
+    /* Diagnostics ALWAYS go to stderr: in serve mode stdout IS the protocol, and
+     * one stray line there throws the gateway off. */
+    fprintf(stderr, "config: %d layers, dim %d, %d heads x %d, %d experts top-%d\n",
             M->n_layers, M->dim, heads, hd, n_exp, topk);
 
-    /* --- freqs_cis con YaRN --------------------------------------------- */
-    M->max_seq = 2048;                 /* suficiente para prompts de prueba */
+    /* --- freqs_cis with YaRN -------------------------------------------- */
+    M->max_seq = 2048;                 /* enough for test prompts */
     M->freqs = malloc((size_t)M->max_seq * (rd / 2) * 2 * sizeof(float));
     dsv4_precompute_freqs(M->freqs, rd, M->max_seq, orig, base, factor, bf, bs);
 
@@ -645,7 +647,7 @@ static void model_load(Model *M, const char *dir) {
     M->hc_head_base  = (float *)raw_of(&M->S, "hc_head_base");
     M->hc_head_scale = (float *)raw_of(&M->S, "hc_head_scale");
 
-    /* --- por capa -------------------------------------------------------- */
+    /* --- per layer ------------------------------------------------------- */
     M->cfg = calloc((size_t)M->n_layers, sizeof(DsV4BlockCfg));
     M->w   = calloc((size_t)M->n_layers, sizeof(DsV4BlockW));
     char nm[192];
@@ -712,7 +714,7 @@ static void model_load(Model *M, const char *dir) {
 
         w->moe.gate_w = mat_of(&M->S, B("layers.%d.ffn.gate", L), n_exp, M->dim);
         if (c->moe.hash) {
-            /* la tabla es la misma para todas las capas hash: se carga una vez */
+            /* the table is shared by every hash layer: loaded once */
             if (!M->tid2eid) {
                 snprintf(nm, sizeof nm, "layers.%d.ffn.gate.tid2eid", L);
                 const int64_t nb = st_nbytes(&M->S, nm);
@@ -732,34 +734,34 @@ static void model_load(Model *M, const char *dir) {
         w->moe.s_w3 = mat_of(&M->S, B("layers.%d.ffn.shared_experts.w3", L), inter, M->dim);
 #undef B
         if ((L + 1) % 8 == 0 || L == M->n_layers - 1)
-            fprintf(stderr, "\r  capas cargadas: %d/%d", L + 1, M->n_layers), fflush(stderr);
+            fprintf(stderr, "\r  layers loaded: %d/%d", L + 1, M->n_layers), fflush(stderr);
     }
     fprintf(stderr, "\n");
 
-    /* --- tier de expertos ------------------------------------------------ */
-    /* ~13,4 MB por experto. El tamaño manda sobre el I/O, que es el cuello de
-     * botella real, así que se deja ajustable para poder medirlo. */
+    /* --- the expert tier ------------------------------------------------- */
+    /* ~13.4 MB per expert. The size governs the I/O, which is the real
+     * bottleneck, so it stays adjustable in order to be measurable. */
     { const char *tp = getenv("DSV4_TRACE"); if (tp) g_trace = fopen(tp, "w"); }
     const char *cenv = getenv("DSV4_CACHE");
     const int cache = cenv ? atoi(cenv)
                      : (g_cache_per_layer ? g_cache_per_layer * M->n_layers : 384);
     tier_init(&M->tier, &M->S, M->n_layers, n_exp, inter, M->dim, cache);
-    /* Cada capa pide sus expertos al tier por callback: el MoE no sabe nada de
-     * shards ni de política de caché. */
+    /* Each layer asks the tier for its experts by callback: the MoE knows nothing
+     * about shards or about cache policy. */
     for (int L = 0; L < M->n_layers; L++) {
         M->w[L].moe.fetch = tier_fetch;
         M->w[L].moe.prefetch = tier_prefetch_cb;
         M->w[L].moe.fetch_ctx = &M->tier;
         M->w[L].moe.layer = L;
     }
-    fprintf(stderr, "expertos: streaming con cache de %d slots de %d totales\n",
+    fprintf(stderr, "experts: streaming with a %d-slot cache out of %d total\n",
             cache, M->n_layers * n_exp);
-    fprintf(stderr, "cargado en %.1f s\n\n", now_s() - t0);
+    fprintf(stderr, "loaded in %.1f s\n\n", now_s() - t0);
 }
 
 /* ---------------------------------------------------------------------------
- * Forward de un token (decode) o de un prompt (prefill).
- * `h` es el stream residual [hc, dim] de UNA posición (batch 1).
+ * Forward for one token (decode) or one prompt (prefill).
+ * `h` is the [hc, dim] residual stream of a SINGLE position (batch 1).
  * ------------------------------------------------------------------------- */
 static void model_layer_decode(Model *M, int L, DsV4AttnState *st,
                                const float *hin, int pos, int32_t tokid,
@@ -775,7 +777,7 @@ static void model_layer_decode(Model *M, int L, DsV4AttnState *st,
     float *mid  = malloc((size_t)hc * dim * sizeof(float));
     float *tmp  = malloc((size_t)dim * sizeof(float));
 
-    /* --- atención --- */
+    /* --- attention --- */
     dsv4_hc_pre(hin, w->hc_attn_fn, w->hc_attn_scale, w->hc_attn_base,
                 hc, dim, c->sinkhorn_iters, c->hc_eps, c->norm_eps,
                 coll, post, comb);
@@ -792,7 +794,7 @@ static void model_layer_decode(Model *M, int L, DsV4AttnState *st,
                 coll, post, comb);
     dsv4_rmsnorm(tmp, coll, w->ffn_norm, dim, c->norm_eps);
     for (int d = 0; d < dim; d++) coll[d] = dsv4_to_bf16(tmp[d]);
-    /* el id del token sólo lo usan las capas hash, pero se pasa siempre */
+    /* only the hash layers use the token id, but it is always passed */
     { const double _t = now_s();
       dsv4_moe_forward(&c->moe, &w->moe, coll, &tokid, 1, sub);
       g_t_moe += now_s() - _t; }
@@ -802,21 +804,21 @@ static void model_layer_decode(Model *M, int L, DsV4AttnState *st,
 }
 
 /* ---------------------------------------------------------------------------
- * Un pase de decode reutilizable.
+ * A reusable decode pass.
  *
- * Lo comparten el modo CLI y el modo serve: la única diferencia entre generar
- * desde la línea de órdenes y desde la pasarela HTTP es de dónde viene el
- * prompt y a dónde van los tokens.
+ * Shared by CLI mode and serve mode: the only difference between generating from
+ * the command line and generating through the HTTP gateway is where the prompt
+ * comes from and where the tokens go.
  * ------------------------------------------------------------------------- */
 typedef struct {
     Model *M;
     DsV4AttnState *st;
     float *h, *h2, *logits, *emb;
     int pos;
-    /* Los ids YA metidos por `run_step`, en orden. Es el historial contra el
-     * que se compara el prompt siguiente para reaprovechar el prefijo comun.
-     * Se anota dentro de run_step, asi que no puede desincronizarse del
-     * estado por mucho que cambie el bucle de arriba. */
+    /* The ids ALREADY fed by `run_step`, in order. This is the history the next
+     * prompt is compared against in order to reuse the common prefix. It is
+     * recorded inside run_step, so it cannot drift out of sync with the state no
+     * matter how the loop above changes. */
     int *hist, nhist, hcap;
 } Run;
 
@@ -835,10 +837,10 @@ static void run_init(Run *R, Model *M) {
     R->hist = malloc((size_t)R->hcap * sizeof(int));
 }
 
-/* Entre peticiones hay que tirar TODO el estado de atención, no sólo el anillo
- * KV: cada capa comprimida arrastra el bloque en curso del compresor y, si es
- * ratio 4, el del indexer. Reaprovechar uno a medias mezcla dos conversaciones
- * de una forma que no da error, sólo texto raro. */
+/* Between requests ALL of the attention state has to go, not just the KV ring:
+ * every compressed layer carries the compressor's in-progress block and, at
+ * ratio 4, the indexer's as well. Reusing one half-way mixes two conversations in
+ * a way that raises no error, just strange text. */
 static void run_reset(Run *R) {
     Model *M = R->M;
     for (int L = 0; L < M->n_layers; L++) {
@@ -850,7 +852,7 @@ static void run_reset(Run *R) {
     R->nhist = 0;
 }
 
-/* Un token adentro, los logits afuera. */
+/* One token in, the logits out. */
 static const float *run_step(Run *R, int tokid) {
     Model *M = R->M;
     const int dim = M->dim, hc = M->hc;
@@ -880,8 +882,8 @@ static const float *run_step(Run *R, int tokid) {
 }
 
 /* ---------------------------------------------------------------------------
- * Muestreo. El CLI usa argmax; la pasarela manda temperatura y top_p por
- * petición, así que hace falta el nucleus de verdad.
+ * Sampling. The CLI uses argmax; the gateway sends temperature and top_p per
+ * request, so real nucleus sampling is needed.
  * ------------------------------------------------------------------------- */
 static uint64_t g_rng = 0x853c49e6748fea9bULL;
 static double rnd01(void) {
@@ -915,7 +917,7 @@ static int sample_tok(const float *logits, int n, float temp, float top_p) {
         pr[v] = expf((logits[idx[v]] - top) / temp);
         sum += pr[v];
     }
-    /* nucleus: se corta cuando la masa acumulada llega a top_p */
+    /* nucleus: cut once the accumulated mass reaches top_p */
     const double cut = (top_p > 0.0f && top_p < 1.0f) ? top_p * sum : sum;
     double acc = 0.0;
     int last = n - 1;
@@ -928,13 +930,13 @@ static int sample_tok(const float *logits, int n, float temp, float top_p) {
 }
 
 /* ---------------------------------------------------------------------------
- * Modo serve: el protocolo mux que habla `openai_server.py`.
+ * Serve mode: the mux protocol openai_server.py speaks.
  *
- * Mismo formato de línea que `colibri.c` e `inkling.c` —byte a byte, para que
- * la pasarela sea la misma— con una simplificación: un solo slot de KV. El mux
- * admite hasta 16 y reaprovecha el prefijo común de cada conversación; aquí
- * cada petición reinicia el estado. Es correcto, sólo más lento en turnos
- * largos, y evita replicar los estados de compresor e indexer por slot.
+ * The same line format as colibri.c and inkling.c — byte for byte, so the
+ * gateway can be shared — with one simplification: a single KV slot. The mux
+ * allows up to 16 and reuses each conversation's common prefix; here a single
+ * slot is kept warm across requests instead, which avoids replicating the
+ * compressor and indexer states per slot.
  * ------------------------------------------------------------------------- */
 static double rss_gb(void) {
     struct rusage r;
@@ -950,7 +952,7 @@ typedef struct {
     int plen;
 } ServeReq;
 
-/* -1 EOF, 0 nada util, 1 cancelar la peticion activa, 2 nueva peticion */
+/* -1 EOF, 0 nothing useful, 1 cancel the active request, 2 a new request */
 static int serve_read_req(ServeReq *q, const char *active) {
     char line[512], cmd[16], id[64];
     if (!fgets(line, sizeof line, stdin)) return -1;
@@ -964,11 +966,11 @@ static int serve_read_req(ServeReq *q, const char *active) {
         || plen < 0 || plen > (1 << 24) || max_tok < 1) {
         printf("ERROR %s BAD_FRAME\n", id); fflush(stdout); return 0;
     }
-    (void)slot;                        /* un solo slot: ver la nota de arriba */
+    (void)slot;                        /* single slot: see the note above */
     char *payload = malloc((size_t)plen + 1);
     if (!payload) { printf("ERROR %s BAD_REQUEST\n", id); fflush(stdout); return 0; }
     if (fread(payload, 1, (size_t)plen, stdin) != (size_t)plen) { free(payload); return -1; }
-    (void)fgetc(stdin);                /* el \n que cierra el frame */
+    (void)fgetc(stdin);                /* the \n that closes the frame */
     payload[plen] = 0;
     snprintf(q->id, sizeof q->id, "%s", id);
     q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
@@ -989,29 +991,29 @@ static void serve_one(Run *R, ServeReq *q) {
     const int cap = 65536;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = 0;
-    ids[np++] = M->bos;                              /* el modelo lo espera */
+    ids[np++] = M->bos;                              /* the model expects it */
     np += tok_encode(&M->tok, q->payload, q->plen, ids + np, cap - np);
     if (np <= 1) {
         printf("ERROR %s EMPTY_PROMPT\n", q->id); fflush(stdout); free(ids); return;
     }
 
-    /* REAPROVECHAR EL PREFIJO (el "truncate-and-extend" del protocolo).
+    /* PREFIX REUSE (the protocol's "truncate-and-extend").
      *
-     * En una conversación, el prompt de un turno es el anterior más la
-     * respuesta del modelo más el mensaje nuevo: una EXTENSIÓN pura de lo que
-     * ya se metió. Comparando con el historial se saltan todas esas capas y
-     * sólo se procesa la cola nueva. Sin esto, el tercer turno de una charla de
-     * 300 tokens cuesta ~420 s antes de escribir la primera palabra.
+     * In a conversation, a turn's prompt is the previous one plus the model's
+     * reply plus the new message: a pure EXTENSION of what has already been fed.
+     * Comparing against the history skips all of those layers and processes only
+     * the new tail. Without this, the third turn of a 300-token chat costs ~420 s
+     * before the first word appears.
      *
-     * Cuando el prompt DIVERGE (el cliente edita el historial, o llega otra
-     * conversación) haría falta retroceder el estado, y eso aquí no se puede:
-     * el anillo KV sí, pero los compresores y el indexer acumulan el bloque en
-     * curso y no se pueden "desacumular". En ese caso se reinicia entero, que
-     * es correcto y sólo más lento. */
+     * When the prompt DIVERGES (the client edits the history, or a different
+     * conversation arrives) the state would have to be rewound, and that is not
+     * possible here: the KV ring could be, but the compressors and the indexer
+     * accumulate an in-progress block that cannot be "un-accumulated". In that
+     * case everything is rebuilt, which is correct and merely slower. */
     int reuse = 0;
     while (reuse < R->nhist && reuse < np && R->hist[reuse] == ids[reuse]) reuse++;
     if (reuse < R->nhist || reuse >= np) { run_reset(R); reuse = 0; }
-    if (reuse) fprintf(stderr, "[serve] prefijo reaprovechado: %d de %d tokens\n", reuse, np);
+    if (reuse) fprintf(stderr, "[serve] prefix reused: %d of %d tokens\n", reuse, np);
 
     const uint64_t hit0 = M->tier.hits, miss0 = M->tier.miss;
     const double t0 = now_s();
@@ -1021,13 +1023,13 @@ static void serve_one(Run *R, ServeReq *q) {
     double tdec = 0.0;
     for (int step = reuse; ; step++) {
         const float *lo = run_step(R, tokid);
-        if (step + 1 < np) { tokid = ids[step + 1]; continue; }   /* aún prefill */
+        if (step + 1 < np) { tokid = ids[step + 1]; continue; }   /* still prefill */
         if (gen == 0) tdec = now_s();
 
         const int nx = sample_tok(lo, M->vocab, q->temp, q->top_p);
-        /* 128805 = <|EOT|>: el formato de chat de DeepSeek lo usa además del
-         * end-of-sentence del config. Parar sólo en el segundo deja el turno
-         * corriendo hasta agotar max_tokens. */
+        /* 128805 = <|EOT|>: DeepSeek's chat format uses it in addition to the
+         * end-of-sentence id from the config. Stopping only on the latter lets
+         * the turn run until max_tokens is exhausted. */
         if (nx == M->eos || nx == 128805) { limited = 0; break; }
 
         char piece[64];
@@ -1042,7 +1044,7 @@ static void serve_one(Run *R, ServeReq *q) {
             const int r = serve_read_req(&extra, q->id);
             if (r < 0) { cancelled = 1; break; }
             if (r == 1) cancelled = 1;
-            if (r == 2) {                            /* un solo slot */
+            if (r == 2) {                            /* single slot */
                 printf("ERROR %s SLOT_BUSY\n", extra.id); fflush(stdout);
                 free(extra.payload);
             }
@@ -1079,30 +1081,30 @@ static void serve_loop(Run *R) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    /* Dimensiona el equipo OpenMP a los núcleos FÍSICOS, sin SMT. Medido aquí:
-     * 19,0 s con 16 hilos lógicos frente a 17,1 s con 8 físicos, y encima la
-     * espera de I/O baja de 8,8 a 6,6 s porque los lectores dejan de pelearse
-     * con el cálculo por los mismos núcleos. Con 4 se pierde por el otro lado.
+    /* Size the OpenMP team to PHYSICAL cores, no SMT. Measured here: 19.0 s with
+     * 16 logical threads against 17.1 s with 8 physical ones, and on top of that
+     * the I/O wait drops from 8.8 to 6.6 s because the readers stop fighting the
+     * compute over the same cores. At 4 threads it loses on the other side.
      *
-     * `omp_tune.h` toma SÓLO el dimensionamiento y deja fuera el spin-wait a
-     * propósito: en un motor que saca los tokens del disco, un equipo girando
-     * en vacío le roba los núcleos al I/O que hace el trabajo de verdad. Este
-     * motor está en ese régimen (el I/O es el 40 % del tiempo). */
+     * omp_tune.h deliberately takes ONLY the sizing and leaves the spin-wait out:
+     * in an engine that pulls its tokens off the disk, a team spinning idle steals
+     * cores from the I/O doing the real work. This engine is in that regime (I/O
+     * is 40 % of the time). */
     coli_omp_tune_threads("deepseek_v4");
 
-    /* La pasarela lanza el motor con SNAP=<dir>, SERVE=1 y NGEN=<max_tokens>,
-     * y le pasa el `cap` de la caché como argv[1]. */
+    /* The gateway launches the engine with SNAP=<dir>, SERVE=1 and
+     * NGEN=<max_tokens>, and passes the cache `cap` as argv[1]. */
     const char *sv = getenv("SERVE");
     if (sv && sv[0] == '1') {
 #ifdef _WIN32
-        /* Sin esto, la traduccion CRLF del CRT corrompe los centinelas y deja
-         * colgadas las lecturas por bytes contados (colibri #195). */
+        /* Without this the CRT's CRLF translation corrupts the sentinels and
+         * stalls the byte-counted reads. */
         _setmode(_fileno(stdin),  _O_BINARY);
         _setmode(_fileno(stdout), _O_BINARY);
 #endif
         const char *snap = getenv("SNAP");
-        if (!snap || !*snap) { fprintf(stderr, "SERVE=1 necesita SNAP=<dir>\n"); return 1; }
-        /* MinGW no trae setenv, así que el cap viaja por variable global. */
+        if (!snap || !*snap) { fprintf(stderr, "SERVE=1 needs SNAP=<dir>\n"); return 1; }
+        /* MinGW has no setenv, so the cap travels through a global instead. */
         if (argc > 1 && atoi(argv[1]) > 0) g_cache_per_layer = atoi(argv[1]);
         Model M;
         model_load(&M, snap);
@@ -1127,14 +1129,14 @@ int main(int argc, char **argv) {
     snprintf(tokp, sizeof tokp, "%s/tokenizer.json", dir);
     tok_load(&M.tok, tokp);
 
-    /* BOS delante: el checkpoint no trae plantilla de chat, pero sí
-     * `<|begin_of_sentence|>` (id 0), y el modelo se entrenó viéndolo. */
+    /* BOS up front: the checkpoint ships no chat template, but it does have
+     * `<|begin_of_sentence|>` (id 0), and the model was trained seeing it. */
     int ids[1024];
     ids[0] = 0;
     int n = 1 + tok_encode(&M.tok, prompt, (int)strlen(prompt), ids + 1, 1000);
-    printf("prompt: \"%s\" -> %d tokens (con BOS)\n", prompt, n);
+    printf("prompt: \"%s\" -> %d tokens (with BOS)\n", prompt, n);
 
-    /* estado por capa */
+    /* per-layer state */
     DsV4AttnState *st = calloc((size_t)M.n_layers, sizeof(DsV4AttnState));
     for (int L = 0; L < M.n_layers; L++)
         dsv4_state_init_full(&st[L], 1, M.cfg[L].attn.hd, M.cfg[L].attn.win,
@@ -1146,14 +1148,14 @@ int main(int argc, char **argv) {
     float *logits = malloc((size_t)M.vocab * sizeof(float));
     float *emb = malloc((size_t)dim * sizeof(float));
 
-    printf("generando %d tokens...\n\n%s", ngen, prompt);
+    printf("generating %d tokens...\n\n%s", ngen, prompt);
     const double tgen = now_s();
     int pos = 0;
     for (int step = 0; step < n + ngen; step++) {
-        /* `ids[step]` siempre: para step < n es el prompt, y a partir de ahí lo
-         * escribió la iteración anterior. Realimentar `ids[step-1]` —que es lo
-         * que hacía antes— repite el último token del prompt y descarrila la
-         * generación desde el primer paso. */
+        /* Always `ids[step]`: for step < n that is the prompt, and beyond it the
+         * previous iteration wrote it. Feeding back `ids[step-1]` — which is what
+         * this loop did at first — repeats the prompt's last token and derails the
+         * generation from the very first step. */
         const int tokid = ids[step];
         g_tok_no = step;
 
@@ -1191,22 +1193,22 @@ int main(int argc, char **argv) {
         }
     }
     const double dt = now_s() - tgen;
-    printf("\n\n%d tokens en %.1f s (%.2f tok/s)\n", n + ngen, dt, (n + ngen) / dt);
-    printf("perfil (total): atencion %.1f s | MoE %.1f s | head %.1f s | resto %.1f s\n",
+    printf("\n\n%d tokens in %.1f s (%.2f tok/s)\n", n + ngen, dt, (n + ngen) / dt);
+    printf("profile (total): attention %.1f s | MoE %.1f s | head %.1f s | rest %.1f s\n",
            g_t_attn, g_t_moe, g_t_head, dt - g_t_attn - g_t_moe - g_t_head);
-    printf("  I/O: %llu tandas de prefetch, %.1f expertos por tanda, %d lectores\n"
-           "       %.2f GB por prefetch, %.2f GB por el camino de respaldo\n",
+    printf("  I/O: %llu prefetch batches, %.1f experts each, %d readers\n"
+           "       %.2f GB via prefetch, %.2f GB via the fallback path\n",
            (unsigned long long)g_pf_batches,
            g_pf_batches ? (double)g_pf_reads / g_pf_batches : 0.0, M.tier.nthreads,
            (double)(M.tier.bytes - g_fb_bytes) / 1e9, (double)g_fb_bytes / 1e9);
-    printf("  del MoE, %.1f s son I/O de expertos y %.1f s computo\n",
+    printf("  of the MoE, %.1f s is expert I/O and %.1f s is compute\n",
            g_t_io, g_t_moe - g_t_io);
-    printf("expertos: %llu hits / %llu miss (%.0f%% acierto), %.2f GB leidos\n",
+    printf("experts: %llu hits / %llu miss (%.0f%% hit rate), %.2f GB read\n",
            (unsigned long long)M.tier.hits, (unsigned long long)M.tier.miss,
            100.0 * M.tier.hits / (double)(M.tier.hits + M.tier.miss),
            (double)M.tier.bytes / 1e9);
-    printf("  cache de %d slots (%.1f GB); %llu expertos distintos en total\n"
-           "  -> una cache infinita tendria %llu fallos en vez de %llu\n",
+    printf("  cache of %d slots (%.1f GB); %llu distinct experts in total\n"
+           "  -> an infinite cache would miss %llu times instead of %llu\n",
            M.tier.cap, M.tier.cap * 13.4e6 / 1e9,
            (unsigned long long)g_distinct,
            (unsigned long long)g_distinct, (unsigned long long)M.tier.miss);
