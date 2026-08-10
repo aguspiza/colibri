@@ -1,20 +1,20 @@
-/* dsv4_weight.h — un peso, en el formato en que vino del checkpoint.
+/* dsv4_weight.h — a weight, in whatever format it came out of the checkpoint.
  *
- * El motor NO puede dequantizar a f32 al cargar: el conjunto denso son 6,7 GiB
- * en FP8, que en f32 serían 26,8 GiB, y esta máquina tiene 31,4 GB de RAM en
- * total. Sumando embeddings no cabe.
+ * The engine CANNOT dequantize to f32 at load time: the dense set is 6.7 GiB in
+ * FP8, which would be 26.8 GiB as f32, and this host has 31.4 GB of RAM in total.
+ * Add the embeddings and it does not fit.
  *
- * Así que los pesos se quedan tal cual salieron del fichero y el matmul
- * dequantiza sobre la marcha, sin materializar nunca la matriz. Es la misma
- * decisión que toma colibrì con su struct `QT` y sus `fmt=N`.
+ * So the weights stay exactly as they left the file and the matmul dequantizes on
+ * the fly, never materializing the matrix. Same decision colibri makes with its
+ * `QT` struct and its `fmt=N` values.
  *
- * Cada `kind` corresponde a un formato real del checkpoint de
- * DeepSeek-V4-Flash-0731:
+ * Each `kind` maps to a format that actually occurs in the
+ * DeepSeek-V4-Flash-0731 checkpoint:
  *
- *   F32     los fixtures del modelo tiny (para no romper las 95 validaciones)
- *   BF16    embeddings, lm_head, normas, router, wkv/wgate de los Compressors
- *   FP8B    el denso: e4m3 + escala UE8M0 por bloque de 128x128
- *   MXFP4   los expertos rutados: nibbles e2m1 + escala ue8m0 por cada 32
+ *   F32     the tiny model's fixtures (so the 95 validations keep working)
+ *   BF16    embeddings, lm_head, norms, router, the Compressors' wkv/wgate
+ *   FP8B    the dense set: e4m3 + a UE8M0 scale per 128x128 block
+ *   MXFP4   the routed experts: e2m1 nibbles + a ue8m0 scale per 32 values
  */
 
 #ifndef DSV4_WEIGHT_H
@@ -37,12 +37,12 @@ typedef enum {
 
 typedef struct {
     DsV4WKind kind;
-    const void *w;        /* pesos: float*, uint16_t* o uint8_t* según kind */
-    const uint8_t *s;     /* escalas; NULL en F32/BF16 */
-    int O, I;             /* forma LÓGICA [O, I] */
+    const void *w;        /* weights: float*, uint16_t* or uint8_t*, per kind */
+    const uint8_t *s;     /* scales; NULL for F32/BF16 */
+    int O, I;             /* LOGICAL shape [O, I] */
 } DsV4W;
 
-/* Envoltorios para construir el descriptor sin equivocarse de campo. */
+/* Wrappers, so the descriptor cannot be built with the fields swapped. */
 static inline DsV4W dsv4_w_f32(const float *p, int O, int I) {
     DsV4W w = { DSV4_W_F32, p, NULL, O, I };
     return w;
@@ -60,14 +60,13 @@ static inline DsV4W dsv4_w_mxfp4(const void *p, const uint8_t *s, int O, int I) 
     return w;
 }
 
-/* Sub-matriz de `nrows` filas a partir de `row0`.
+/* A sub-matrix of `nrows` rows starting at `row0`.
  *
- * La necesita la proyección de salida agrupada: `wo_a` es [groups*o_lora, dpg] y
- * cada grupo usa su bloque de filas (`model.py` lo hace con un `.view()` y un
- * einsum). Rebanar filas es válido en los cuatro formatos porque todos son
- * row-major, pero con FP8B hay una condición: las escalas van por bloques de
- * 128 filas, así que `row0` debe ser múltiplo de 128. En el modelo real
- * o_lora=1024 = 8x128, así que cuadra. */
+ * The grouped output projection needs it: `wo_a` is [groups*o_lora, dpg] and each
+ * group uses its own block of rows (model.py does it with a `.view()` and an
+ * einsum). Slicing rows is valid in all four formats since all are row-major, but
+ * FP8B carries a condition: the scales go in blocks of 128 rows, so `row0` must be
+ * a multiple of 128. In the real model o_lora=1024 = 8x128, so it lines up. */
 static inline DsV4W dsv4_w_rows(const DsV4W *W, int row0, int nrows) {
     DsV4W r = *W;
     r.O = nrows;
@@ -80,7 +79,7 @@ static inline DsV4W dsv4_w_rows(const DsV4W *W, int row0, int nrows) {
         break;
     case DSV4_W_FP8B:
         if (row0 % DSV4_FP8_BLOCK) {
-            fprintf(stderr, "dsv4_w_rows: FP8B exige row0 multiplo de %d (row0=%d)\n",
+            fprintf(stderr, "dsv4_w_rows: FP8B needs row0 to be a multiple of %d (row0=%d)\n",
                     DSV4_FP8_BLOCK, row0);
             exit(1);
         }
@@ -107,8 +106,8 @@ static inline float dsv4_bf16_to_f32(uint16_t h) {
 
 /* y[S,O] = x[S,I] @ W^T
  *
- * `bf16out` redondea la salida, como hacen las capas Linear del modelo. Las del
- * Compressor van en fp32 y piden 0 (ver dsv4_attn.h). */
+ * `bf16out` rounds the output, the way the model's Linear layers do. The
+ * Compressor's own layers run in fp32 and pass 0 (see dsv4_attn.h). */
 static inline void dsv4_matmul_w(float *y, const float *x, const DsV4W *W,
                                  int S, int bf16out)
 {
@@ -137,8 +136,8 @@ static inline void dsv4_matmul_w(float *y, const float *x, const DsV4W *W,
                 float acc = 0.0f;
                 int i = 0;
 #if defined(__AVX2__) && defined(__FMA__)
-                /* bf16 -> f32 es exacto y sin tablas: son los 16 bits altos del
-                 * f32, así que basta extender a 32 y desplazar. */
+                /* bf16 -> f32 is exact and needs no table: they are the high 16
+                 * bits of the f32, so zero-extend to 32 and shift. */
                 __m256 va = _mm256_setzero_ps();
                 for (; i + 8 <= I; i += 8) {
                     const __m256i w32 = _mm256_slli_epi32(
@@ -167,29 +166,29 @@ static inline void dsv4_matmul_w(float *y, const float *x, const DsV4W *W,
         break;
     case DSV4_W_MXFP4:
 #ifdef DSV4_WITH_MXFP4
-        /* `matmul_mxfp4` es de colibrì y ya trae rutas AVX-512/AVX2. Es `static`
-         * en quant.h, así que no se puede declarar `extern`: hay que incluir
-         * quant.h en la misma unidad de traducción y definir DSV4_WITH_MXFP4.
-         * Los tests del modelo tiny no lo hacen —no tienen pesos MXFP4— y así se
-         * evita arrastrar 1.569 líneas de kernels a un binario que no los usa. */
+        /* `matmul_mxfp4` is colibri's and already has AVX-512/AVX2 paths. It is
+         * `static` in quant.h, so it cannot be declared `extern`: quant.h has to
+         * be included in the same translation unit with DSV4_WITH_MXFP4 defined.
+         * The tiny-model tests do not — they have no MXFP4 weights — which keeps
+         * 1,569 lines of kernels out of a binary that never calls them. */
         matmul_mxfp4(y, x, (const uint8_t *)W->w, W->s, S, I, O);
         if (bf16out)
             for (int64_t i = 0; i < (int64_t)S * O; i++)
                 y[i] = dsv4_to_bf16(y[i]);
 #else
-        fprintf(stderr, "dsv4_matmul_w: MXFP4 requiere quant.h "
-                        "y -DDSV4_WITH_MXFP4\n");
+        fprintf(stderr, "dsv4_matmul_w: MXFP4 needs quant.h "
+                        "and -DDSV4_WITH_MXFP4\n");
         exit(1);
 #endif
         break;
     default:
-        fprintf(stderr, "dsv4_matmul_w: peso sin inicializar (kind=%d)\n", W->kind);
+        fprintf(stderr, "dsv4_matmul_w: uninitialized weight (kind=%d)\n", W->kind);
         exit(1);
     }
 }
 
-/* Vector f32 desde cualquier formato de 1-D (normas, bias, attn_sink).
- * `out` debe tener `n` floats. */
+/* An f32 vector from any 1-D format (norms, biases, attn_sink).
+ * `out` must hold `n` floats. */
 static inline void dsv4_vec_f32(float *out, const DsV4W *W, int n) {
     switch (W->kind) {
     case DSV4_W_F32:

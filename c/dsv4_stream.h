@@ -1,24 +1,25 @@
-/* dsv4_stream.h — fase 3: los expertos dejan de estar en RAM.
+/* dsv4_stream.h — where the experts stop living in RAM.
  *
- * Es la razón de ser del port. Los expertos rutados son el 97,5 % del modelo
- * (277B de 284B, 137 GiB en disco), y colibrì no los carga: los **coloca**.
- * Cada token activa 6 de 256 por capa, así que sólo hacen falta ~3,4 GB por
- * token, y esos se leen del disco justo cuando el router demuestra que hacen
- * falta.
+ * This is the whole point of the port. The routed experts are 97.5 % of the model
+ * (277B of 284B, 137 GiB on disk), and colibri does not load them: it PLACES
+ * them. Each token activates 6 of 256 per layer, so only ~3.4 GB per token is
+ * ever needed, and that is read off the disk exactly when the router proves it is
+ * needed.
  *
- * Aquí está la versión mínima de esa maquinaria —caché LRU por capa, lectura
- * posicionada, promoción— sobre el modelo tiny. La infraestructura real de
- * colibrì (pool de hilos, PILOT, batch-union, O_DIRECT, dual-SSD) es agnóstica
- * al modelo y se engancha igual; lo que había que demostrar es que el motor de
- * DeepSeek-V4 puede alimentarse desde disco **sin cambiar un solo bit del
- * resultado**.
+ * What follows is the minimal version of that machinery — per-layer LRU cache,
+ * positioned read, promotion — exercised on the tiny model. colibri's real
+ * infrastructure (thread pool, PILOT, batch-union, O_DIRECT, multi-drive) is
+ * model-agnostic and hooks in the same way; what had to be shown here is that a
+ * DeepSeek-V4 engine can be fed from disk WITHOUT CHANGING A SINGLE BIT of the
+ * result.
  *
- * Ese es el invariante que colibrì no negocia y el criterio de esta fase:
+ * That is the invariant colibri does not negotiate, and the acceptance criterion
+ * for this stage:
  *
- *     la colocación decide la VELOCIDAD, nunca la SEMÁNTICA
+ *     placement decides SPEED, never SEMANTICS
  *
- * Si un token cambia según el experto viniera de RAM o de disco, el port está
- * mal por rápido que sea.
+ * If a token changes depending on whether the expert came from RAM or from disk,
+ * the port is wrong no matter how fast it is.
  */
 
 #ifndef DSV4_STREAM_H
@@ -30,26 +31,26 @@
 #include <stdint.h>
 
 typedef struct {
-    int eid;                 /* -1 = vacío */
-    float *buf;              /* w1 | w2 | w3 contiguos */
-    uint64_t used;           /* reloj lógico del LRU */
+    int eid;                 /* -1 = empty */
+    float *buf;              /* w1 | w2 | w3, contiguous */
+    uint64_t used;           /* the LRU's logical clock */
 } DsV4Slot;
 
 typedef struct {
     FILE *f;
     int n_layers, n_experts, cap;
-    int64_t floats;          /* floats por experto (w1+w2+w3) */
+    int64_t floats;          /* floats per expert (w1+w2+w3) */
     DsV4Slot *slots;         /* [n_layers * cap] */
-    int *nslot;              /* [n_layers] ocupación de cada caché */
+    int *nslot;              /* [n_layers] how full each cache is */
     uint64_t clock, hits, miss, bytes;
 } DsV4Store;
 
-/* Escribe los expertos en disco con el layout de colibrì: las tres matrices de
- * cada experto CONTIGUAS, para que una sola lectura traiga el experto entero.
+/* Writes the experts to disk in colibri's layout: an expert's three matrices
+ * CONTIGUOUS, so that one read brings the whole expert in.
  *
- * En el checkpoint real de DeepSeek no están así —safetensors agrupa todos los
- * `.weight` en una zona y todas las `.scale` en otra, o sea 2 lecturas por
- * experto (§7.3 del análisis)—, pero el principio es el mismo. */
+ * The real DeepSeek checkpoint is not laid out that way — safetensors groups all
+ * the `.weight` tensors in one region and all the `.scale` tensors in another, so
+ * two reads per expert — but the principle is the same. */
 static inline int dsv4_store_write(const char *path, int n_layers, int n_experts,
                                    int64_t floats_per_mat,
                                    const float ***w1, const float ***w2,
@@ -90,10 +91,10 @@ static inline void dsv4_store_close(DsV4Store *s) {
     if (s->f) fclose(s->f);
 }
 
-/* Devuelve el experto (w1|w2|w3 contiguos), leyéndolo si no está en caché.
+/* Returns the expert (w1|w2|w3 contiguous), reading it in if it is not cached.
  *
- * Búsqueda lineal como en colibrì: la caché de una capa son unas decenas de
- * slots, y frente a los megabytes que cuesta un fallo, buscar es ruido. */
+ * Linear search, as in colibri: a layer's cache is a few dozen slots, and against
+ * the megabytes a miss costs, searching is noise. */
 static inline const float *dsv4_store_get(DsV4Store *s, int layer, int eid) {
     DsV4Slot *lc = s->slots + (size_t)layer * s->cap;
     for (int i = 0; i < s->nslot[layer]; i++)
@@ -104,7 +105,7 @@ static inline const float *dsv4_store_get(DsV4Store *s, int layer, int eid) {
         }
 
     s->miss++;
-    /* elegir hueco: primero vacío, si no el LRU */
+    /* pick a slot: an empty one first, otherwise the LRU victim */
     int dst;
     if (s->nslot[layer] < s->cap) {
         dst = s->nslot[layer]++;
@@ -117,13 +118,13 @@ static inline const float *dsv4_store_get(DsV4Store *s, int layer, int eid) {
 
     const int64_t idx = (int64_t)layer * s->n_experts + eid;
     const int64_t off = idx * s->floats * (int64_t)sizeof(float);
-    /* Lectura posicionada. Aquí basta fseek+fread porque el arnés es de un solo
-     * hilo; el pool de colibrì usa `pread` precisamente porque el offset de un
-     * descriptor es estado compartido y varios hilos se pisarían. */
+    /* Positioned read. fseek+fread is enough here because the harness is
+     * single-threaded; colibri's pool uses `pread` precisely because a
+     * descriptor's offset is shared state and several threads would clobber it. */
     if (fseek(s->f, (long)off, SEEK_SET) != 0 ||
         fread(lc[dst].buf, sizeof(float), (size_t)s->floats, s->f)
             != (size_t)s->floats) {
-        fprintf(stderr, "[stream] fallo leyendo experto L%d E%d\n", layer, eid);
+        fprintf(stderr, "[stream] failed reading expert L%d E%d\n", layer, eid);
         exit(1);
     }
     s->bytes += (uint64_t)s->floats * sizeof(float);

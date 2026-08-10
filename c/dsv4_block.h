@@ -1,9 +1,9 @@
-/* dsv4_block.h — la capa completa: mHC + atención + mHC + MoE.
+/* dsv4_block.h — the whole layer: mHC + attention + mHC + MoE.
  *
- * Sigue `ref/model.py::Block.forward`. El stream residual NO es el clásico
- * `x + f(x)`: se mantienen `hc_mult` copias del estado y cada sub-capa las
- * colapsa a una, calcula, y vuelve a expandirlas con una matriz de mezcla
- * normalizada por Sinkhorn.
+ * Follows ref/model.py::Block.forward. The residual stream is NOT the usual
+ * `x + f(x)`: `hc_mult` copies of the state are kept, and each sub-layer
+ * collapses them to one, computes, and expands them back through a mixing matrix
+ * normalized by Sinkhorn.
  *
  *     residual = x                      [b, s, hc, d]
  *     x, post, comb = hc_pre(x, hc_attn_*)
@@ -23,16 +23,16 @@
 #include "dsv4_moe.h"
 
 /* ---------------------------------------------------------------------------
- * hc_pre: colapsar las `hc` copias en una.
+ * hc_pre: collapse the `hc` copies into one.
  *
- * Detalle que se escapa: el matmul de `hc_fn` va sobre el estado SIN
- * normalizar, y la normalización entra después como un escalar
- * (`F.linear(x, hc_fn) * rsqrt`). Y el colapso `sum(pre * x)` también usa el
- * estado sin normalizar. Normalizar primero y luego multiplicar da lo mismo en
- * exacto, pero no en punto flotante — y sobre todo, si se normaliza el estado
- * que se colapsa, el resultado ya no es el mismo.
+ * The detail that is easy to miss: the `hc_fn` matmul runs on the UNNORMALIZED
+ * state, and the normalization enters afterwards as a scalar
+ * (`F.linear(x, hc_fn) * rsqrt`). The `sum(pre * x)` collapse also uses the
+ * unnormalized state. Normalizing first and multiplying after is the same in
+ * exact arithmetic but not in floating point — and, more importantly, if the
+ * state being collapsed is normalized then the result is simply not the same.
  *
- *   x    : [hc*d]  (una posición)
+ *   x    : [hc*d]  (one position)
  *   out  : [d]     post: [hc]     comb: [hc*hc]
  * ------------------------------------------------------------------------- */
 static inline void dsv4_hc_pre(const float *x, const float *hc_fn,
@@ -48,7 +48,7 @@ static inline void dsv4_hc_pre(const float *x, const float *hc_fn,
     for (int i = 0; i < n; i++) ss += (double)x[i] * x[i];
     const float rsqrt = 1.0f / sqrtf((float)(ss / n) + norm_eps);
 
-    float mixes[64];                       /* mix_hc = 24 con hc_mult = 4 */
+    float mixes[64];                       /* mix_hc = 24 when hc_mult = 4 */
     for (int m = 0; m < mix_hc; m++) {
         const float *row = hc_fn + (size_t)m * n;
         float acc = 0.0f;
@@ -65,12 +65,12 @@ static inline void dsv4_hc_pre(const float *x, const float *hc_fn,
 }
 
 /* ---------------------------------------------------------------------------
- * hc_head: el colapso FINAL, tras la última capa.
+ * hc_head: the FINAL collapse, after the last layer.
  *
- * Comparte la forma con `hc_pre` (matmul sobre el estado sin normalizar, escala
- * por rsqrt) pero es más simple: no hay Sinkhorn ni `post`/`comb`, sólo una
- * sigmoide. Tiene sentido — ya no hay que reexpandir a `hc` copias, aquí se
- * cierra el stream.
+ * Same shape as `hc_pre` (matmul on the unnormalized state, scaled by rsqrt) but
+ * simpler: no Sinkhorn and no `post`/`comb`, just a sigmoid. Which makes sense —
+ * there is nothing left to re-expand into `hc` copies, this is where the stream
+ * closes.
  *
  *   hc_fn : [hc, hc*dim]   hc_base : [hc]   hc_scale : [1]
  * ------------------------------------------------------------------------- */
@@ -110,11 +110,11 @@ typedef struct {
     const float *hc_ffn_fn,  *hc_ffn_base,  *hc_ffn_scale;
 } DsV4BlockW;
 
-/* x, out : [b, s, hc, dim] — el stream residual con sus `hc` copias */
-/* `dbg_route` (opcional, puede ser NULL) recibe los índices que el router del
- * MoE eligió. Sirve para diagnosticar: el top-k es discreto, así que una
- * desviación numérica mínima en su entrada puede cambiar de experto y provocar
- * un error localizado y grande, muy distinto del redondeo repartido. */
+/* x, out : [b, s, hc, dim] — the residual stream with its `hc` copies */
+/* `dbg_route` (optional, may be NULL) receives the indices the MoE router chose.
+ * It exists for diagnosis: the top-k is discrete, so a tiny numerical deviation
+ * on its input can flip an expert and produce one large localized error, which
+ * looks nothing like evenly spread rounding. */
 static inline void dsv4_block_forward(const DsV4BlockCfg *c,
                                       const DsV4BlockW *w,
                                       const float *x, const int *winidx,
@@ -133,7 +133,7 @@ static inline void dsv4_block_forward(const DsV4BlockCfg *c,
     float *mid  = malloc((size_t)bs * stride * sizeof(float));
     float *tmp  = malloc((size_t)dim * sizeof(float));
 
-    /* --- sub-capa 1: atención ------------------------------------------- */
+    /* --- sub-layer 1: attention ----------------------------------------- */
     for (int64_t r = 0; r < bs; r++)
         dsv4_hc_pre(x + r * stride, w->hc_attn_fn, w->hc_attn_scale,
                     w->hc_attn_base, hc, dim, c->sinkhorn_iters, c->hc_eps,
@@ -150,7 +150,7 @@ static inline void dsv4_block_forward(const DsV4BlockCfg *c,
         dsv4_hc_expand(mid + r * stride, sub + r * dim, post + r * hc,
                        comb + r * hc * hc, x + r * stride, hc, dim);
 
-    /* --- sub-capa 2: MoE ------------------------------------------------ */
+    /* --- sub-layer 2: MoE ----------------------------------------------- */
     for (int64_t r = 0; r < bs; r++)
         dsv4_hc_pre(mid + r * stride, w->hc_ffn_fn, w->hc_ffn_scale,
                     w->hc_ffn_base, hc, dim, c->sinkhorn_iters, c->hc_eps,
