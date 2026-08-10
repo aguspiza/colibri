@@ -1,306 +1,212 @@
-# DeepSeek-V4-Flash-0731 — port en curso
+# DeepSeek-V4-Flash — an independent port (`c/dsv4_port.c`)
 
-**DeepSeek-V4-Flash** (284B / 13B activos, contexto de 1M) como familia hermana
-de colibrì. El motor **corre y genera texto**:
+A second, self-contained implementation of **DeepSeek-V4-Flash** (284B total /
+13B active, 1M context), written from the reference implementation upward with
+every primitive validated in isolation before assembly.
+
+> **Read this first.** `c/deepseek_v4.c` is the *production* V4 engine and this
+> is not it. This port was written independently and in parallel; upstream's
+> engine is further along (unit build, DSpark in `c/deepseek_v4_dspark.inc`,
+> `deepseek_v4` arch in `openai_server.py`). What this file is still good for:
+>
+> - **the pre-tokenizer finding** below, which is a real bug the production path
+>   still has (see `pretok_chunk_dsv4` in `tok.h`, now shared by both);
+> - a **per-primitive reference** of the new architecture, each piece pinned to a
+>   measured error against DeepSeek's own reference code;
+> - the measurement log in
+>   [deepseek-v4-performance.md](deepseek-v4-performance.md), whose findings
+>   apply to any CPU V4 engine.
+
+It runs and generates text:
 
 ```
-$ DSV4_CACHE=512 ./deepseek_v4 /modelos/DeepSeek-V4-Flash-0731 "La capital de Francia es" 8
-config: 43 capas, dim 4096, 64 cabezas x 512, 256 expertos top-6
-expertos: streaming con cache de 512 slots de 11008 totales
+$ ./dsv4_port /models/DeepSeek-V4-Flash-0731 "La capital de Francia es" 8
+config: 43 layers, dim 4096, 64 heads x 512, 256 experts top-6
 
 La capital de Francia es una de las ciudades más visitadas del mundo
 
-14 tokens en 21.6 s (0.65 tok/s)
-perfil (total): atencion 4.4 s | MoE 16.5 s | head 0.3 s | resto 0.5 s
-  del MoE, 12.2 s son I/O de expertos y 4.3 s computo
-expertos: 1765 hits / 1847 miss (49% acierto), 24.69 GB leidos
+14 tokens in 16.8 s (0.83 tok/s)
 ```
 
-En un Ryzen 5700U (Zen 2, **sin AVX-512**) con 17,9 GB de RAM libre y el
-checkpoint en un NVMe.
+On a Ryzen 5700U (Zen 2, **no AVX-512**) with the checkpoint on an NVMe. It also
+speaks the mux serve protocol, so `openai_server.py` drives it over HTTP.
 
-> La bitácora completa de optimización —cómo se llegó de 0,16 a 0,78 tok/s, y
-> las tres hipótesis obvias que resultaron falsas— está en
-> [deepseek-v4-performance.md](deepseek-v4-performance.md).
+## Why the model is a good fit
 
-## Dónde se iba el tiempo
-
-La primera versión daba 0,16 tok/s. Medir antes de tocar nada dejó el reparto
-claro, y no era el que yo suponía:
-
-| | antes | ahora | qué pasaba |
-|---|---|---|---|
-| Atención | 35,5 s (55 %) | **4,4 s** | kernel FP8 escalar, y luego un `gather` |
-| `lm_head` | 1,9 s | **0,3 s** | ídem, en BF16 |
-| MoE cómputo | 11,1 s | **4,3 s** | el router BF16, también escalar |
-| MoE I/O | 15,9 s | **12,2 s** | las lecturas se serializaban (ver abajo) |
-
-El MoE ya iba rápido porque usa `matmul_mxfp4` de colibrì, que sí trae AVX2. El
-resto lo había escrito yo priorizando que fuese legible y verificable contra la
-referencia, y se notaba: la atención hacía 4,6 GMAC/token en 3,5 s mientras el
-MoE hacía 6,5 GMAC en 1,1 s — **4,5× más lento por MAC**.
-
-Vectorizar (AVX2+FMA) y repartir las filas de salida entre los 8 núcleos da
-**2,6×**. Los errores contra la referencia no se mueven ni un dígito
-(FP8 4,82e-07, MoE 1,67e-03): el orden de acumulación cambia, la precisión no.
-
-### El `gather` costaba otro 2x
-
-Vectorizado, el kernel FP8 seguía dando **14 GFLOP/s** mientras el MXFP4 de este
-repo saca 33 sobre el mismo hardware. La atención relee sus 5,40 GB de pesos
-residentes en cada token, y eso salían 8,4 GB/s efectivos: demasiado poco para
-ser un límite de RAM.
-
-La causa era decodificar e4m3 con `_mm256_i32gather_ps` sobre una LUT de 256
-floats. Cabe en L1, pero **en Zen 2 el gather se ejecuta como 8 accesos
-secuenciados y no se encadena**. Sale mucho mejor con aritmética de bits: para
-`exp != 0` basta `mag << 20` —que deja la mantisa en 22..20 y el exponente en
-26..23— y sumar `120 << 23` para corregir el sesgo (e4m3 usa 7, f32 usa 127);
-para `exp == 0` el valor es subnormal y vale `mant * 2^-9`.
-
-Atención **9,0 -> 4,4 s**, o sea 18 GB/s: ahora sí es el ancho de banda de la
-memoria. Mismo error contra la referencia, 4,82e-07.
-
-Detalle de formato: `mag == 0x7F` es NaN en OCP E4M3-FN y la fórmula aritmética
-daría 480. Se respeta con un `blend`, aunque el checkpoint no traiga ninguno
-(comprobado: el máximo es 0x7E = 448) — si un día aparece, mejor que se propague
-a que se lea como un número válido.
-
-## Un handle por hilo, o el disco va a un tercio
-
-Con el cómputo arreglado el I/O pasó a ser el 58 % del tiempo: 20 GB por cada 14
-tokens a **1,28 GB/s**. Di por hecho que era el techo del NVMe —el prefetch ya
-lanzaba las lecturas del `top-k` sobre 16 hilos— y me equivoqué. Medido en frío
-y con conjuntos disjuntos, replicando el patrón real de acceso:
-
-| | 1 hilo | 4 hilos | 8+ |
-|---|---|---|---|
-| lecturas dispersas de 4 MB | 1,06 GB/s | 2,73 GB/s | ~2,9 GB/s |
-
-El motor sacaba 1,28: **el ritmo de un solo lector**. La causa es que
-`compat_pread` hace `ReadFile`+`OVERLAPPED` sobre un handle abierto en modo
-síncrono, y en Windows el SO serializa la E/S sobre el objeto fichero aunque le
-pases un `OVERLAPPED`. El paralelismo era aparente.
-
-La solución es **un descriptor por hilo y shard** (48 x 16 handles, abiertos al
-cargar). Con eso el I/O baja de 20,6 a 12,3 s y el ancho de banda sube a 1,98
-GB/s. De paso, los offsets de los 66.048 tensores de experto se resuelven una
-vez al cargar, y los buffers de cada slot se reservan una sola vez: el
-`realloc` estaba en la parte serie de cada tanda.
-
-**Cuidado al medir esto.** Los dos primeros intentos dieron 7,6 y 4,0 GB/s
-porque las pasadas releían los mismos tensores desde la caché de páginas del SO
-— estaban midiendo RAM. `posix_fadvise(DONTNEED)` no basta en Windows; hace
-falta que cada medida toque bytes que nadie ha leído antes.
-
-## Lo que NO funcionó: procesar varios tokens a la vez
-
-Parecía la siguiente palanca obvia, y la medida decía que no.
-
-Los tokens consecutivos comparten expertos, así que un lote de 5 pide 724
-expertos-capa distintos en vez de 5x258=1290 — 1,78x menos *peticiones*. Pero
-ésa es la comparación equivocada: el baseline real no son 258 peticiones por
-token sino **124,2 fallos de caché**, porque la LRU ya estaba explotando ese
-mismo solapamiento. Simulando la política de caché sobre la traza de ruteo real
-(el simulador reproduce **exactamente** los 2.980 fallos que mide el motor):
-
-| lote | fallos/token | vs secuencial |
-|---|---|---|
-| 1 (hoy) | **124,2** | — |
-| 2 | 138,5 | 0,90x |
-| 5 | 162,2 | 0,77x |
-| 8 | 138,1 | 0,90x |
-
-Agrupar **empeora**. En orden secuencial cada capa se revisita cada 258 accesos
-y con 512 slots eso cabe; en lotes de 5 se revisita cada 724 y no cabe, así que
-la agrupación convierte aciertos de caché en deduplicación y encima pierde.
-
-Y no es cuestión de tener más RAM. Barriendo el tamaño de caché en el simulador,
-agrupar **no gana nunca**:
-
-| caché | secuencial | lote 5 | lote 8 |
-|---|---|---|---|
-| 512 (6,9 GB) | **124,2** | 151,6 | 129,1 |
-| 1024 (13,7 GB) | **101,5** | 105,4 | 110,4 |
-| ≥2048 (27 GB+) | **86,0** | 86,0 | 86,0 |
-
-A partir de ~2.048 slots los fallos se saturan en los *obligatorios* —cada
-experto distinto se lee una vez— y ahí no hay nada que agrupar pueda mejorar.
-El único ahorro que quedaría es amortizar los 5,40 GB/token de pesos de
-atención, y ése se ataca más barato arreglando el kernel (ver arriba).
-
-`dsv4_moe.h` implementa igualmente el recorrido por **unión** de expertos —cada
-uno se aplica a todas las filas que lo eligieron— porque es correcto y hace
-falta para cualquier camino por lotes. Con `rows==1` el orden de acumulación es
-el de antes y el decode da los mismos bits.
-
-> **Sigue siendo trabajo en curso.** El forward está entero y validado pieza a
-> pieza contra la implementación de referencia de DeepSeek, pero falta la pila
-> MTP/DSpark, el enganche con `coli`, y el streaming real de colibrì (pool de
-> hilos, PILOT, batch-union, `O_DIRECT`, dual-SSD) en lugar de la caché LRU
-> mínima que trae `deepseek_v4.c`. Lista completa al final.
-
-## Por qué encaja bien
-
-Medido sobre el checkpoint real, no estimado:
+Measured on the real checkpoint, not estimated:
 
 | | GLM-5.2 | DeepSeek-V4-Flash |
 |---|---|---|
-| Disco | 372 GB | **156 GiB** |
-| Residente | 17B → 9,9 GB en int4 | **8,67 GiB en precisión nativa** |
-| Tráfico de expertos por token | ~11,4 GB | **~3,45 GB** |
-| Expertos rutados | 256, top-8 | 256, **top-6** |
+| On disk | 372 GB | **156 GiB** |
+| Resident | 17B → 9.9 GB in int4 | **8.67 GiB at native precision** |
+| Expert traffic per token | ~11.4 GB | **~3.45 GB** |
+| Routed experts | 256, top-8 | 256, **top-6** |
 
-Los expertos son el 97,5 % del modelo (277B de 284B) y vienen en **MXFP4
-nativo**: e2m1 empaquetado 2 nibbles por byte con una escala ue8m0 por cada 32
-valores. Es exactamente lo que consume `matmul_mxfp4` para Kimi K3, así que se
-streamean de los shards de Hugging Face **sin conversión**.
+The experts are 97.5 % of the model (277B of 284B) and ship as **native MXFP4**:
+e2m1 packed two nibbles per byte, with one ue8m0 scale per 32 values. That is
+exactly what `matmul_mxfp4` already consumes for Kimi K3, so they stream straight
+out of the Hugging Face shards **with no conversion**.
 
-## Los dos parches a colibrì
+## The tokenizer bug, which is still live
 
-Sin ellos el checkpoint no se puede abrir. Son pequeños y de utilidad general.
-
-### 1. `st.h` — dtypes que DeepSeek etiqueta explícitamente
-
-`st_dtype_code` sólo conocía BF16/F16/F32/U8/I8. DeepSeek etiqueta los bytes
-cuantizados con su dtype real en vez de U8:
-
-| dtype | tensores | qué es |
-|---|---|---|
-| `F8_E8M0` | 35.718 | las escalas MX |
-| `F8_E4M3` | 390 | el conjunto denso |
-| `I64` | 3 | las tablas `tid2eid` del routing hash |
-
-Los tres se añaden como bytes crudos —que es lo que son— más un tamaño de
-elemento propio para los enteros. `st_read_raw` ya era agnóstico al dtype.
-
-Detalle: `model.py` declara `tid2eid` como `int32`, pero el checkpoint la guarda
-en **I64**.
-
-### 2. `tok.h` — formato de merges y familia de pre-tokenizer
-
-**Merges.** `tok.h` aceptaba sólo el formato nuevo de `tokenizers` (arrays
-`["izq","der"]`); DeepSeek usa el antiguo (cadena `"izq der"`) y la carga
-fallaba con `malformed merge entry 0`. Partir por el primer espacio literal es
-seguro: en byte-level los espacios del texto van como U+0120, nunca como 0x20.
-
-**Pre-tokenizer.** DeepSeek no resuelve el pre-tokenizer en una alternación como
-cl100k/o200k/kimi: encadena un `Sequence` de tres `Split` con
-`behavior=Isolated`, y la **primera aísla los dígitos**. El orden no es
-equivalente a meterlo todo en un regex. Caso mínimo que lo destapa:
+DeepSeek does **not** resolve its pre-tokenizer as a single alternation the way
+cl100k / o200k / kimi do. It chains a `Sequence` of three `Split` stages with
+`behavior=Isolated`, and **the first one isolates digits**. That ordering is not
+equivalent to folding everything into one regex. The minimal case:
 
 ```
-"\  0"    DeepSeek -> "\", "  ", "0"        (doble espacio, UN token)
+"\  0"    DeepSeek -> "\", "  ", "0"        (the double space, ONE token)
           cl100k   -> "\", " ", " ", "0"
 ```
 
-Al separar el dígito antes, la racha de espacios que lo precede se queda sin
-nada detrás dentro de su trozo y se agrupa entera. `pretok_chunk_dsv4`
-implementa las etapas 0 (dígitos en grupos de ≤3) y 1 (han + kana) como
-pre-paso y delega los huecos en `pretok_chunk`.
+Splitting the digit off first leaves the run of spaces with nothing after it
+inside its own chunk, so the run is grouped whole. `pretok_chunk_dsv4` implements
+stage 0 (digits in groups of ≤3) and stage 1 (han + kana) as a pre-pass and hands
+the gaps to `pretok_chunk`, whose alternation matches stage 2 on everything
+measured.
 
-Verificado contra `tokenizers`: **2.623 líneas, 0 diferencias** — 400 sintéticas
-(latín, CJK, cirílico, árabe, emoji, código) y 2.223 de texto real.
+This matters beyond this port: `tok.h` had no V4 pre-tokenizer at all, and the
+production engine calls `tok_encode`, so DeepSeek prompts were falling through to
+the generic path. Verified against `tokenizers`: **399 cases, 0 differences**,
+including the case above.
 
-## Lo nuevo de la arquitectura
+*Two other patches this port used to carry are now upstream's and better:* the
+old-format merges (`"left right"` as one string) and the explicitly-tagged
+dtypes in `st.h` — upstream gives each dtype its own code, accepts the
+`F8_E4M3FN`/`F8_E8M0FNU`/`U64` aliases, and refuses them in the float readers.
 
-Lo que no existe en el motor GLM. Cada pieza está validada contra la
-implementación de referencia de DeepSeek sobre el checkpoint real.
+## What the architecture adds
 
-| pieza | fichero | verificación |
+None of this exists in the GLM engine. Every piece is validated against
+DeepSeek's reference implementation on the real checkpoint.
+
+| piece | file | verification |
 |---|---|---|
-| **mHC** — residual `[b,s,4,dim]` con Sinkhorn | `dsv4_math.h` | err rel ~1e-7 |
-| **CSA** — Compressor con puerta aprendida | `dsv4_math.h` | error 0.00e+00 |
-| **Indexer** sobre KV comprimida | `dsv4_math.h` | 0/1536 índices distintos |
-| `sparse_attn` con sumidero por cabeza | `dsv4_math.h` | 0 fuera de 1 ULP bf16 |
-| RoPE entrelazada, directa e inversa | `dsv4_math.h` | error 0.00e+00 |
-| FP8-e4m3 con escalas **UE8M0** | `dsv4_fp8.h` | 4,82e-07 |
-| Router `sqrtsoftplus` + routing hash | `dsv4_moe.h` | 0/48 índices distintos |
-| Bloque de atención (3 tipos) | `dsv4_attn.h` | 3,6e-03 a 4,3e-03 |
-| Camino de **decode** incremental | `dsv4_decode.h` | 3,8e-03 a 5,9e-03 |
-| Bloque MoE, 256 expertos MXFP4 | `dsv4_moe.h` | 1,67e-03 |
+| **mHC** — residual `[b,s,4,dim]` with Sinkhorn | `dsv4_math.h` | rel err ~1e-7 |
+| **CSA** — Compressor with a learned gate | `dsv4_math.h` | error 0.00e+00 |
+| **Indexer** over the compressed KV | `dsv4_math.h` | 0/1536 indices differ |
+| `sparse_attn` with a per-head sink | `dsv4_math.h` | 0 outside 1 bf16 ULP |
+| Interleaved RoPE, forward and inverse | `dsv4_math.h` | error 0.00e+00 |
+| FP8-e4m3 with **UE8M0** scales | `dsv4_fp8.h` | 4.82e-07 |
+| `sqrtsoftplus` router + hash routing | `dsv4_moe.h` | 0/48 indices differ |
+| Attention block (all 3 kinds) | `dsv4_attn.h` | 3.6e-03 to 4.3e-03 |
+| Incremental **decode** path | `dsv4_decode.h` | 3.8e-03 to 5.9e-03 |
+| MoE block, 256 MXFP4 experts | `dsv4_moe.h` | 1.67e-03 |
 
-Los errores del orden de 1e-3 son acumulación de bf16 (ε = 3,9e-3), la misma
-banda en la que caen las capas del modelo de referencia.
+The 1e-3 figures are bf16 accumulation (ε = 3.9e-3), the same band the reference
+model's own layers land in.
 
-### El denso: colibrì ya lo rechazaba a propósito
+### The dense set: colibrì was refusing it on purpose
 
-`colibri.c:1485` menciona este modelo por su nombre:
+`colibri.c` named this model explicitly:
 
 > *"DeepSeek-V4 ships the SAME weight layout (FP8 E4M3, 128x128 blocks) with
 > UE8M0 [...] recognizing the signature and refusing is safer than misreading"*
 
-`fmt=8` lee esa geometría pero espera la escala en f32, como la publica Z.ai;
-DeepSeek la publica en UE8M0 de 1 byte. `dsv4_fp8.h` es el decodificador que
-faltaba. Cuidado con la convención **OCP E4M3-FN**: `exp==0xF` no está reservado
-para infinito —sólo `mant==0x7` lo es— así que el máximo finito es 448.
+`fmt=8` reads that geometry but expected the scale in f32, the way Z.ai publishes
+it; DeepSeek publishes it as 1-byte UE8M0. `dsv4_fp8.h` was the missing decoder —
+upstream has since added UE8M0 to `fmt=8` itself, which is the better home for it.
 
-## Reparto de memoria
+Watch the **OCP E4M3-FN** convention: `exp==0xF` is *not* reserved for infinity,
+only `mant==0x7` is, so the largest finite value is 448. Treating it as IEEE
+would silently lose the format's top magnitudes.
 
-Es la decisión de diseño central, y la que hace que quepa:
+## Memory split
+
+This is the central design decision, and the reason it fits at all:
 
 ```
-residente en RAM    8,67 GiB   atención, normas, routers, expertos compartidos,
-                               embeddings y lm_head — EN SU FORMATO NATIVO
-por streaming     137,10 GiB   los 11.008 expertos rutados, del NVMe, con LRU
+resident in RAM     8.67 GiB   attention, norms, routers, shared experts,
+                               embeddings and lm_head — IN THEIR NATIVE FORMAT
+streamed          137.10 GiB   the 11,008 routed experts, off the NVMe, with LRU
 ```
 
-Los descriptores de `dsv4_weight.h` hacen que el matmul lea FP8/BF16/MXFP4
-directamente y **nunca materialice la matriz dequantizada**. Dequantizar el
-denso a f32 serían 26,8 GiB y no cabría. Es la misma decisión que toma colibrì
-con su struct `QT`.
+The descriptors in `dsv4_weight.h` let the matmul read FP8/BF16/MXFP4 directly
+and **never materialize the dequantized matrix**. Dequantizing the dense set to
+f32 would be 26.8 GiB and would not fit. It is the same decision colibrì makes
+with its `QT` struct.
 
-## Lo que falta
+`DSV4_LOAD` selects how the bytes get there (`read` / `dense` / `all`) and trades
+speed for private memory; see the performance log for the measurements.
 
-- **Integración con `coli`**: `deepseek_v4.c` es autónomo (carga, tokeniza,
-  genera). Falta que el launcher lo reconozca por `model_type` y que hable el
-  protocolo del gateway.
-- **MTP / DSpark**: 4.705 tensores (6,5 %). Son 3 bloques con `markov_head` y
-  `confidence_head` — la pila MTP *es* la implementación de DSpark. El modelo
-  genera sin ella, pero es **la vía con más recorrido para el rendimiento**, no
-  un adorno. El `config.json` la describe entera:
+## MTP / DSpark, and why this port skips it
 
-  ```
-  dspark_block_size: 5          num_nextn_predict_layers: 1
-  dspark_target_layer_ids: [40, 41, 42]
-  dspark_markov_rank: 256       dspark_noise_token_id: 128799
-  ```
+4,705 tensors (6.5 %). Three blocks with `markov_head` and `confidence_head` —
+the MTP stack *is* the DSpark implementation. `config.json` describes it fully:
 
-  **Cabe en memoria**: de sus 10,12 GiB en disco sólo **0,55 GiB son densos**
-  (atención, `shared_experts`, `gate`, las `hc_*` y las dos cabezas); los otros
-  9,56 GiB son expertos y van por streaming. El residente pasaría de 8,67 a
-  9,22 GiB. Cada bloque es un bloque normal —atención + MoE de 256 expertos +
-  compartido— así que reutiliza las primitivas ya validadas; lo nuevo son
-  `markov_head`, `confidence_head` y el bucle de aceptación.
+```
+dspark_block_size: 5          num_nextn_predict_layers: 1
+dspark_target_layer_ids: [40, 41, 42]
+dspark_markov_rank: 256       dspark_noise_token_id: 128799
+```
 
-  Con decode greedy la aceptación es **exacta y trivial**: se acepta el prefijo
-  más largo cuyos tokens borrador coincidan con el argmax del modelo principal,
-  sin muestreo por rechazo ni umbral de confianza. Y el criterio de validación
-  es inmejorable: el texto tiene que salir idéntico.
+**It fits in memory**: of its 10.12 GiB on disk only **0.55 GiB is dense**
+(attention, `shared_experts`, `gate`, the `hc_*` params and the two heads); the
+other 9.56 GiB are experts and stream like the rest. Resident would go from 8.67
+to 9.22 GiB. Each block is an ordinary block — attention + a 256-expert MoE +
+shared expert — so it reuses the already-validated primitives; what is new is
+`markov_head`, `confidence_head` and the acceptance loop.
 
-  Pero **en esta máquina no compensa**, por la tabla de lotes de arriba: el
-  ahorro de I/O es negativo con una caché de 512 slots, y el borrador cuesta 3
-  capas más de expertos por ciclo. Es una conclusión de esta configuración, no
-  del método: con RAM para una caché de ~10 GB se daría la vuelta.
+With greedy decode, acceptance is **exact and trivial**: accept the longest
+prefix whose draft tokens match the main model's argmax, no rejection sampling
+and no confidence threshold. The validation criterion is as good as it gets — the
+text has to come out identical.
 
-  Dos trampas para quien lo implemente: **son 3 bloques, no 1** — el
-  `num_nextn_predict_layers: 1` del `config.json` no corresponde con el
-  `n_mtp_layers` de `model.py`, y hay que derivarlo del checkpoint (`mtp.0`
-  tiene `main_proj`/`main_norm`, `mtp.2` tiene `norm`/`markov_head`/
-  `confidence_head`/`hc_head_*`, `mtp.1` ninguno). Y **DeepSeek no publica el
-  bucle de aceptación**: `generate.py` es decode autoregresivo normal, así que
-  del repo de referencia sale el borrador pero no la verificación.
-- **Streaming real**: enganchar el pool de hilos, `experts_apply_union`, PILOT,
-  `.coli_usage`, `O_DIRECT` y dual-SSD. Es infraestructura ya existente y
-  agnóstica al modelo. Demostrado sobre un modelo reducido que la semántica no
-  cambia (logits bit a bit idénticos con caché de 3 de 8 expertos).
-- **Contexto largo**: CSA/HCA existen para 1M de tokens; lo probado llega a 128.
+**But it does not pay off on this host.** Measured, not assumed: the I/O saving
+is *negative* with a 512-slot cache, and the draft costs three extra layers of
+expert reads per cycle. Worse, after the kernels were fixed the engine sits on
+its AVX2 roofline 47 % of the time, and speculative decoding spends FLOPs to buy
+fewer sequential steps. The full numbers are in the performance log. Upstream's
+engine does implement DSpark, which is the right call for hosts where FLOPs are
+cheaper than this one's.
 
-## Aviso sobre el criterio de validación
+Two traps for anyone implementing it: **there are 3 blocks, not 1** —
+`num_nextn_predict_layers: 1` in `config.json` does not correspond to
+`n_mtp_layers` in `model.py`, and the count has to be derived from the checkpoint
+(`mtp.0` has `main_proj`/`main_norm`, `mtp.2` has
+`norm`/`markov_head`/`confidence_head`/`hc_head_*`, `mtp.1` has neither). And
+**DeepSeek does not publish the acceptance loop**: `generate.py` is a plain
+autoregressive decode, so the reference repo gives you the drafting but not the
+verification.
 
-El top-k del router es **discreto**, y el redondeo bf16 que la atención acumula
-(~1e-3) basta para que un token cercano al empate cambie de experto: medido, 3
-de 448. No es un defecto —cualquier implementación que difiera un ULP hace lo
-mismo— pero significa que un teacher-forcing contra `transformers` **no dará
-32/32 exacto**, y el criterio hay que fijarlo sabiéndolo. Es el mismo problema
-que este repo ya documenta en su top-k del DSA (`colibri.c:3383-3387`).
+## HTTP: the mux serve protocol
+
+`dsv4_port.c` implements the same line protocol as `colibri.c` and `inkling.c`
+(`SUBMIT`/`STOP`/`CANCEL` → `DATA`/`DONE`/`ERROR`), so `openai_server.py` drives
+it unchanged. Verified end to end against the 284B checkpoint:
+`/v1/completions`, `/v1/chat/completions` with and without streaming, multi-turn,
+and `/v1/messages`.
+
+One KV slot only. Prefix reuse across turns is implemented — the engine records
+the ids it has fed and skips the common prefix — which is what makes multi-turn
+usable: without it, a third turn over 300 tokens of history costs ~420 s before
+the first word, because prefill runs one token at a time.
+
+When the prompt **diverges** instead of extending, the state is rebuilt from
+scratch. Rolling back is not possible here: the ring KV could be rewound, but the
+CSA compressors and the indexer accumulate an in-progress block that cannot be
+un-accumulated. That is the same wall that closed off DSpark.
+
+The checkpoint ships no `chat_template.jinja`, but its vocabulary carries the
+V3/R1 role tokens (`<|User|>` 128803, `<|Assistant|>` 128804), which is what the
+gateway renders.
+
+## A caveat about the validation criterion
+
+The router's top-k is **discrete**, and the ~1e-3 of bf16 rounding that attention
+accumulates is enough to flip a near-tied token to a different expert: measured,
+3 of 448. That is not a defect — any implementation differing by one ULP does the
+same — but it means teacher-forcing against `transformers` **will not give 32/32
+exact**, and the acceptance criterion has to be set knowing that. It is the same
+problem this repo already documents for its own DSA top-k.
+
+## Still missing
+
+- **`coli` integration**: the launcher does not know this binary; the gateway has
+  to be pointed at it by hand with `--engine`.
+- **Real streaming**: colibrì's own thread pool, `experts_apply_union`, PILOT,
+  `.coli_usage`, `O_DIRECT`, multi-drive. Model-agnostic infrastructure that
+  already exists. Demonstrated on a reduced model that the semantics do not
+  change (logits bit-identical with a 3-of-8 expert cache).
+- **Long context**: CSA/HCA exist for 1M tokens; what has been exercised here
+  reaches 128.

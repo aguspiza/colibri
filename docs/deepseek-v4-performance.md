@@ -1,6 +1,11 @@
 # DeepSeek-V4-Flash: from 0.16 to 0.83 tok/s
 
-Optimization log for the port's engine on the real 284B checkpoint. It records
+Optimization log for the independent port (`c/dsv4_port.c`, see
+[deepseek-v4-port.md](deepseek-v4-port.md)) on the real 284B checkpoint. Several
+findings apply to any CPU V4 engine, not just this one — in particular the
+Windows read serialization, Zen 2's slow `gather`, and the OpenMP team sizing.
+
+It records
 the changes that worked **and the ones that did not**, because four of the five
 obvious-looking hypotheses turned out to be false, and killing them with a
 measurement cost far less than implementing them.
