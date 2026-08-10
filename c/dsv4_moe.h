@@ -1,12 +1,12 @@
-/* dsv4_moe.h — el bloque MoE: router + expertos rutados + experto compartido.
+/* dsv4_moe.h — the MoE block: router + routed experts + shared expert.
  *
- * Es la pieza que conecta con lo que hace especial a colibrì. Los expertos
- * rutados son el 97,5 % de los parámetros del modelo (277B de 284B) y aquí se
- * aplican desde RAM; en el motor real cada uno llega por streaming desde disco
- * justo cuando el router demuestra que hace falta. El resto del bloque —router,
- * pesos, experto compartido— es idéntico en los dos casos.
+ * This is the piece that meets what makes colibri colibri. The routed experts are
+ * 97.5 % of the model's parameters (277B of 284B); here they can be applied from
+ * RAM, while in the real engine each one arrives by streaming from disk exactly
+ * when the router proves it is needed. The rest of the block -- router, weights,
+ * shared expert -- is identical either way.
  *
- * Sigue `ref/model.py::Gate.forward` y `MoE.forward`.
+ * Follows ref/model.py::Gate.forward and MoE.forward.
  */
 
 #ifndef DSV4_MOE_H
@@ -14,56 +14,56 @@
 
 #include "dsv4_math.h"
 #include "dsv4_attn.h"     /* dsv4_matmul_ex */
-#include "dsv4_stream.h"   /* tier de expertos por streaming (fase 3) */
+#include "dsv4_stream.h"   /* streaming expert tier */
 
 typedef struct {
     int dim, n_experts, topk, inter;
     float route_scale, swiglu_limit;
-    int hash;                  /* capas iniciales: ruta por tabla, no por score */
+    int hash;                  /* early layers: route by table, not by score */
 } DsV4MoeCfg;
 
 typedef struct {
     DsV4W gate_w;              /* [n_experts, dim] */
-    const float *gate_bias;    /* [n_experts] — NULL en las capas hash */
-    const int32_t *tid2eid;    /* [vocab, topk] — sólo en las capas hash */
-    /* Expertos residentes en RAM: un descriptor por experto. */
+    const float *gate_bias;    /* [n_experts] -- NULL on the hash layers */
+    const int32_t *tid2eid;    /* [vocab, topk] -- hash layers only */
+    /* Experts resident in RAM: one descriptor each. */
     const DsV4W *e_w1, *e_w2, *e_w3;
-    DsV4W s_w1, s_w2, s_w3;             /* experto compartido */
+    DsV4W s_w1, s_w2, s_w3;             /* shared expert */
 
-    /* Ruta de STREAMING (fase 3). Si `store` no es NULL, los expertos rutados
-     * NO se leen de `e_w*` sino del disco, a través de la caché por capa. El
-     * experto compartido se queda residente: se usa en todos los tokens, así
-     * que streamearlo sería absurdo — es exactamente la distinción que hace
-     * colibrì entre el conjunto denso y el tier rutado. */
+    /* STREAMING path. When `store` is non-NULL the routed experts are read from
+     * disk through the per-layer cache instead of from `e_w*`. The shared expert
+     * stays resident: it is used by every token, so streaming it would be
+     * pointless -- which is exactly the distinction colibri draws between the
+     * dense set and the routed tier. */
     DsV4Store *store;
-    int layer;                          /* qué capa pedirle al store */
+    int layer;                          /* which layer to ask the store for */
 
-    /* Tercera vía: un callback que devuelve los descriptores del experto. Lo
-     * usa el motor real, donde los expertos viven en los shards del checkpoint
-     * y hay una caché LRU por medio. Se hace con puntero a función para que
-     * `dsv4_moe.h` no tenga que conocer `st.h` ni la política de caché. */
+    /* Third route: a callback that hands back the expert's descriptors. This is
+     * what the real engine uses, where the experts live in the checkpoint shards
+     * with an LRU cache in between. It is a function pointer so that dsv4_moe.h
+     * need know nothing about st.h or about the cache policy. */
     void (*fetch)(void *ctx, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4W *w3);
     void *fetch_ctx;
 
-    /* Prefetch opcional: el router ya sabe los `topk` expertos ANTES de aplicar
-     * ninguno, así que se pueden pedir todos de golpe y dejar que el backend
-     * solape las lecturas. Sin esto se leen de uno en uno con profundidad de
-     * cola 1, que es la peor forma de usar un NVMe. No cambia el resultado:
-     * sólo adelanta trabajo que `fetch` haría igual. */
+    /* Optional prefetch: the router knows all `topk` experts BEFORE any of them
+     * is applied, so they can be requested in one go and the backend can overlap
+     * the reads. Without it they are read one at a time at queue depth 1, which
+     * is the worst way to use an NVMe. It changes nothing about the result: it
+     * only brings forward work `fetch` would do anyway. */
     void (*prefetch)(void *ctx, int layer, const int *es, int n);
 } DsV4MoeW;
 
 /* ---------------------------------------------------------------------------
- * Router. Tres detalles que hay que respetar:
+ * Router. Three details that have to be respected:
  *
- *   1. **El scoring va en fp32**, sin redondear (`linear(x.float(), w.float())`).
- *   2. **El bias sólo decide, no pondera.** Se elige el top-k con `score+bias`
- *      pero se pesa con el score CRUDO. El bias es de balanceo de carga
- *      (noaux_tc), no una opinión sobre el experto. Es idéntico al router de
- *      GLM-5.2 en colibrì; lo único que cambia es sqrtsoftplus en vez de sigmoid.
- *   3. **En las capas hash no hay bias** y los índices salen de una tabla
- *      indexada por el id del token — pero los PESOS se siguen calculando con
- *      el router. O sea que el matmul del router se ejecuta igual.
+ *   1. Scoring runs in fp32, unrounded (`linear(x.float(), w.float())`).
+ *   2. THE BIAS ONLY DECIDES, IT DOES NOT WEIGHT. The top-k is chosen on
+ *      `score+bias` but weighted with the RAW score. The bias is load balancing
+ *      (noaux_tc), not an opinion about the expert. Identical to GLM-5.2's
+ *      router in colibri; the only change is sqrtsoftplus instead of sigmoid.
+ *   3. Hash layers have NO bias and take their indices from a table keyed by
+ *      token id -- but the WEIGHTS are still computed by the router, so the
+ *      router matmul runs regardless.
  *
  *   out_idx : [rows, topk]     out_w : [rows, topk]
  * ------------------------------------------------------------------------- */
@@ -83,7 +83,7 @@ static inline void dsv4_moe_route(const DsV4MoeCfg *c, const DsV4MoeW *w,
             for (int k = 0; k < c->topk; k++)
                 idx[k] = (int)w->tid2eid[(size_t)ids[r] * c->topk + k];
         } else {
-            /* top-k por selección directa: con topk<=8 y E=256 gana a ordenar */
+            /* top-k by direct selection: with topk<=8 and E=256 this beats sorting */
             for (int k = 0; k < c->topk; k++) {
                 int best = -1;
                 float bv = -INFINITY;
@@ -91,7 +91,7 @@ static inline void dsv4_moe_route(const DsV4MoeCfg *c, const DsV4MoeW *w,
                     int taken = 0;
                     for (int j = 0; j < k; j++) if (idx[j] == e) { taken = 1; break; }
                     if (taken) continue;
-                    const float v = sc[e] + w->gate_bias[e];   /* el bias SÓLO decide */
+                    const float v = sc[e] + w->gate_bias[e];   /* the bias ONLY decides */
                     if (v > bv) { bv = v; best = e; }
                 }
                 idx[k] = best;
@@ -107,11 +107,11 @@ static inline void dsv4_moe_route(const DsV4MoeCfg *c, const DsV4MoeW *w,
 }
 
 /* ---------------------------------------------------------------------------
- * Un experto: SwiGLU con clamp, computado en fp32.
+ * One expert: SwiGLU with clamping, computed in fp32.
  *
- * El peso de ruteo multiplica el ESTADO INTERMEDIO, antes de w2, no la salida
- * (`x = weights * x; return self.w2(x)`). Matemáticamente da igual porque w2 es
- * lineal, pero en bf16 no: cambia dónde cae el redondeo.
+ * The routing weight multiplies the INTERMEDIATE STATE, before w2, not the
+ * output (`x = weights * x; return self.w2(x)`). Mathematically equivalent since
+ * w2 is linear, but not in bf16: it moves where the rounding lands.
  * ------------------------------------------------------------------------- */
 static inline void dsv4_expert_apply(const DsV4MoeCfg *c,
                                      const DsV4W *w1, const DsV4W *w2,
@@ -136,11 +136,11 @@ static inline void dsv4_expert_apply(const DsV4MoeCfg *c,
 }
 
 /* ---------------------------------------------------------------------------
- * Bloque MoE completo.
+ * The complete MoE block.
  *
- * `y` acumula en fp32: los expertos rutados primero, el compartido después.
- * El compartido se aplica SIEMPRE y con peso 1 — es el que garantiza que todo
- * token reciba algo aunque el ruteo se desequilibre.
+ * `y` accumulates in fp32: routed experts first, the shared one after. The
+ * shared expert is ALWAYS applied, with weight 1 -- it is what guarantees every
+ * token gets something even if routing goes lopsided.
  * ------------------------------------------------------------------------- */
 static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
                                     const float *x, const int32_t *ids,
@@ -150,35 +150,37 @@ static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
     float *wt = (float *)malloc((size_t)rows * c->topk * sizeof(float));
     dsv4_moe_route(c, w, x, ids, rows, idx, wt);
 
-    /* AVISO sobre las capas hash: aquí se acumulan las `topk` contribuciones,
-     * incluso si dos apuntan al mismo experto. La referencia NO hace eso.
+    /* WARNING about the hash layers: all `topk` contributions accumulate here,
+     * even when two of them point at the same expert. The reference does NOT.
      *
-     * `MoE.forward` escribe `y[idx] += expert(...)` con `idx` sacado de
-     * `torch.where(indices == i)`. Con índices repetidos esa expresión no
-     * acumula: lee, suma y reescribe, así que gana la última escritura y una de
-     * las dos contribuciones se pierde en silencio.
+     * `MoE.forward` writes `y[idx] += expert(...)` with `idx` taken from
+     * `torch.where(indices == i)`. With repeated indices that expression does
+     * not accumulate: it reads, adds and writes back, so the last write wins and
+     * one of the two contributions is silently lost.
      *
-     * Con el top-k por score no puede pasar (los índices salen distintos por
-     * construcción), y una tabla `tid2eid` entrenada tampoco debería repetir.
-     * Pero si un checkpoint real trae duplicados, motor y referencia divergen
-     * — y el motor tendría razón. Conviene comprobar la tabla al cargar.
+     * It cannot happen with score top-k (the indices come out distinct by
+     * construction), and a trained `tid2eid` table should not repeat either. But
+     * if a real checkpoint ever carries duplicates, engine and reference diverge
+     * -- and the engine would be the correct one. Worth checking the table at
+     * load time.
      *
-     * Se detectó porque el oráculo generaba `tid2eid` muestreando CON
-     * reemplazo: 11 de 64 tokens recibían el mismo experto dos veces y el
-     * bloque salía con un error de 2,2e-1 mientras el ruteo era exacto. */
+     * Found because the oracle generated `tid2eid` by sampling WITH replacement:
+     * 11 of 64 tokens got the same expert twice and the block came out with an
+     * error of 2.2e-1 while the routing itself was exact. */
     memset(out, 0, (size_t)rows * c->dim * sizeof(float));
 
-    /* UNIÓN DE EXPERTOS.
+    /* EXPERT UNION.
      *
-     * Con varias filas, el mismo experto suele salir elegido por varias: medido
-     * sobre el checkpoint real, un lote de 5 tokens pide 724 expertos-capa en
-     * vez de 5x258=1290, o sea 1,78x menos lecturas por token. Iterando fila a
-     * fila cada una lo pediría por su cuenta y se leerían 13,4 MB repetidos.
+     * With several rows, the same expert is usually picked by more than one:
+     * measured on the real checkpoint, a batch of 5 tokens asks for 724
+     * layer-experts instead of 5x258=1290, i.e. 1.78x fewer reads per token.
+     * Iterating row by row, each row would request it separately and 13.4 MB
+     * would be read twice.
      *
-     * Se recorre por EXPERTO y dentro por las filas que lo eligieron. El orden
-     * es el de primera aparición, no el de id: con rows==1 eso reproduce
-     * exactamente el orden de acumulación de antes, y el decode sigue dando los
-     * mismos bits. */
+     * The traversal goes BY EXPERT and, inside, over the rows that selected it.
+     * The order is first-appearance, not by id: with rows==1 that reproduces the
+     * previous accumulation order exactly, so decode still yields the same
+     * bits. */
     const int64_t nslots = rows * c->topk;
     int *uniq = (int *)malloc((size_t)nslots * sizeof(int));
     int nu = 0;
@@ -195,8 +197,8 @@ static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
         if (w->fetch) {
             w->fetch(w->fetch_ctx, w->layer, e, &w1, &w2, &w3);
         } else if (w->store) {
-            /* Del disco, con caché LRU. El resto del cálculo es idéntico:
-             * de dónde vinieron los bytes no puede cambiar el resultado. */
+            /* From disk, with an LRU cache. The rest of the computation is
+             * identical: where the bytes came from cannot change the result. */
             const int64_t per = (int64_t)c->inter * c->dim;
             const float *blk = dsv4_store_get(w->store, w->layer, e);
             w1 = dsv4_w_f32(blk,           c->inter, c->dim);
@@ -205,8 +207,8 @@ static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
         } else {
             w1 = w->e_w1[e]; w2 = w->e_w2[e]; w3 = w->e_w3[e];
         }
-        /* Ya está en RAM: se gasta en todas las filas que lo pidieron antes de
-         * que la caché pueda expulsarlo. Es la razón de ser de la unión. */
+        /* It is in RAM now: spend it on every row that asked for it before the
+         * cache can evict it. That is the whole point of the union. */
         for (int64_t r = 0; r < rows; r++)
             for (int k = 0; k < c->topk; k++)
                 if (idx[r * c->topk + k] == e)
@@ -215,7 +217,7 @@ static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
     }
     free(uniq);
 
-    /* El compartido va SIEMPRE y con peso 1, después de los rutados. */
+    /* The shared expert ALWAYS runs, with weight 1, after the routed ones. */
     for (int64_t r = 0; r < rows; r++)
         dsv4_expert_apply(c, &w->s_w1, &w->s_w2, &w->s_w3,
                           x + r * c->dim, 1.0f, out + r * c->dim);
