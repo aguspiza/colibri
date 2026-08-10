@@ -21,7 +21,7 @@ checkpoint en un NVMe.
 
 > La bitácora completa de optimización —cómo se llegó de 0,16 a 0,78 tok/s, y
 > las tres hipótesis obvias que resultaron falsas— está en
-> [deepseek-v4-rendimiento.md](deepseek-v4-rendimiento.md).
+> [deepseek-v4-performance.md](deepseek-v4-performance.md).
 
 ## Dónde se iba el tiempo
 
