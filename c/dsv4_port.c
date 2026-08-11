@@ -944,13 +944,26 @@ static const float *run_step(Run *R, int tokid) {
  * Returns the logits for the LAST position, which is the only one generation
  * needs.
  * ------------------------------------------------------------------------- */
-static const float *run_prefill(Run *R, const int *ids, int n)
+static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
+                                int batch_attn)
 {
     Model *M = R->M;
     const int dim = M->dim, hc = M->hc;
     const size_t stride = (size_t)hc * dim;
 
-    const int chunk = n;
+    /* Batched attention numbers positions from 0, so it cannot continue an existing
+     * KV. The caller only asks for it at pos0 == 0; this is belt and braces, and it
+     * has to come before the chunk is sized. */
+    if (batch_attn && pos0 != 0) batch_attn = 0;
+
+    /* The chunk bounds MEMORY: every buffer below is sized by it, at ~416 KB per
+     * token. Batched attention has to be one chunk, so there the prompt length is
+     * the chunk and the caller caps it; the per-token path is free to cut, and 256
+     * keeps a 5k-token prompt at ~107 MB instead of ~2 GB. */
+    const char *ckenv = getenv("DSV4_CHUNK");
+    int chunk = ckenv ? atoi(ckenv) : 256;
+    if (chunk < 16) chunk = 16;
+    if (batch_attn || n < chunk) chunk = n;
     float *h    = malloc((size_t)chunk * stride * sizeof(float));
     float *mid  = malloc((size_t)chunk * stride * sizeof(float));
     float *coll = malloc((size_t)chunk * dim * sizeof(float));
@@ -983,21 +996,18 @@ static const float *run_prefill(Run *R, const int *ids, int n)
         cap.i_kv_comp = malloc((size_t)(chunk / ratio_min + 2) * i_hd_max * sizeof(float));
     }
     int *tk = malloc((size_t)chunk * M->cfg[0].attn.win * sizeof(int));
+    int lastrow = 0;                  /* row of `h` holding the last token */
 
-    /* ONE chunk, and that is a real limit, not a simplification.
-     *
-     * dsv4_attention_prefill derives each token's RoPE position as `r % s`, i.e.
-     * it assumes the batch starts at position 0. A second chunk would need the
-     * position offset, the window indices to reach back into the previous
-     * chunk's KV, and the already-compressed blocks to be attended -- that is
-     * prefill-with-existing-cache, and it is the next piece of work, not a
-     * detail. Until then the caller checks the length and falls back.
-     *
-     * The cap is memory: ~416 KB per token across h/mid, q/o and the working
-     * buffers, so 512 tokens is ~208 MB and 5k would be ~2 GB. */
-    {
-        const int base = 0;
-        const int cs = n;
+    /* Why batched attention cannot be chunked: dsv4_attention_prefill derives each
+     * token's RoPE position as `r % s`, so it assumes the batch starts at 0. A
+     * second chunk would need the position offset, the window indices reaching
+     * back into the previous chunk's KV, and the already-compressed blocks
+     * attended -- prefill-with-existing-cache, still to do. The per-token path
+     * below has none of those constraints, which is why it is the one that lifts
+     * the length limit. */
+    const int step_n = batch_attn ? n : chunk;
+    for (int base = 0; base < n; base += step_n) {
+        const int cs = (base + step_n <= n) ? step_n : n - base;
 
         /* embedding -> hc copies, for the whole chunk */
         for (int t = 0; t < cs; t++) {
@@ -1025,12 +1035,21 @@ static const float *run_prefill(Run *R, const int *ids, int n)
                     coll[(size_t)t * dim + d] = dsv4_to_bf16(tmp[d]);
             }
             { const double _t = now_s();
-              const int ntopk = dsv4_window_topk_prefill(tk, 1, cs, c->attn.win);
-              dsv4_attention_prefill_cap(&c->attn, &w->attn, coll, tk, 1, cs,
-                                         ntopk, sub, &cap);
-              /* Seed so the tokens after the prompt continue from exactly the
-               * state token-at-a-time decoding would have produced. */
-              dsv4_state_seed_from_prefill(&R->st[L], &c->attn, &w->attn, &cap, cs);
+              if (batch_attn) {
+                  const int ntopk = dsv4_window_topk_prefill(tk, 1, cs, c->attn.win);
+                  dsv4_attention_prefill_cap(&c->attn, &w->attn, coll, tk, 1, cs,
+                                             ntopk, sub, &cap);
+                  /* Seed so the tokens after the prompt continue from exactly the
+                   * state token-at-a-time decoding would have produced. */
+                  dsv4_state_seed_from_prefill(&R->st[L], &c->attn, &w->attn, &cap, cs);
+              } else {
+                  /* Per-token attention keeps the state itself, which is what lets
+                   * a chunk start anywhere. Only the MoE below is batched. */
+                  for (int t = 0; t < cs; t++)
+                      dsv4_attention_decode(&c->attn, &w->attn, &R->st[L],
+                                            coll + (size_t)t * dim, pos0 + base + t,
+                                            sub + (size_t)t * dim);
+              }
               g_t_attn += now_s() - _t; }
             for (int t = 0; t < cs; t++)
                 dsv4_hc_expand(mid + (size_t)t * stride, sub + (size_t)t * dim,
@@ -1060,14 +1079,19 @@ static const float *run_prefill(Run *R, const int *ids, int n)
          * the next chunk agree with the decode path. */
         for (int t = 0; t < cs; t++)
             if (R->hist && R->nhist < R->hcap) R->hist[R->nhist++] = ids[base + t];
-        R->pos = base + cs;
+        R->pos = pos0 + base + cs;
+        lastrow = cs - 1;
     }
 
-    /* logits for the last position only */
+    /* Logits for the last position only.
+     *
+     * `h` holds the CURRENT chunk, not the whole prompt, so this has to index the
+     * last row of the last chunk -- `n - 1` was a read past the end of the buffer
+     * for every prompt that took more than one chunk, and the symptom was fluent
+     * garbage rather than a crash. */
     {
-        const int last = n - 1;
         float y[8192], nz[8192];
-        dsv4_hc_head(h + (size_t)last * stride, M->hc_head_fn, M->hc_head_scale,
+        dsv4_hc_head(h + (size_t)lastrow * stride, M->hc_head_fn, M->hc_head_scale,
                      M->hc_head_base, hc, dim, M->norm_eps, M->hc_eps, y);
         dsv4_rmsnorm(nz, y, M->final_norm, dim, M->norm_eps);
         for (int d = 0; d < dim; d++) nz[d] = dsv4_to_bf16(nz[d]);
@@ -1255,14 +1279,28 @@ static void serve_one(Run *R, ServeReq *q) {
      * regresses -- it is just slower. */
     int step = reuse;
     const float *lo = NULL;
+    /* Two batched paths, and NO length limit any more.
+     *
+     *   one batch, batched attention   fastest (1.51x on 140 tokens), but prefill
+     *                                  numbers positions from 0, so it needs a
+     *                                  fresh state, and the batch costs ~416 KB
+     *                                  per token -- hence the cap.
+     *   chunked, per-token attention   works from any position and at any length,
+     *                                  and still batches the MoE, which is 59 % of
+     *                                  the time.
+     *
+     * A long prompt, or one following a reused prefix, no longer falls all the way
+     * back to one token at a time. */
     const char *pfenv = getenv("DSV4_PREFILL_MAX");
     const int pfmax = pfenv ? atoi(pfenv) : 512;
-    if (reuse == 0 && np > 1 && np <= pfmax) {
+    if (np - reuse > 1) {
+        const int one_batch = (reuse == 0 && np <= pfmax);
         const double t_pf = now_s();
-        lo = run_prefill(R, ids, np);
+        lo = run_prefill(R, ids + reuse, np - reuse, reuse, one_batch);
         const double dt_pf = now_s() - t_pf;
-        fprintf(stderr, "[serve] batched prefill: %d tokens in %.1f s (%.3f s/token)\n",
-                np, dt_pf, dt_pf / np);
+        fprintf(stderr, "[serve] prefill (%s): %d tokens in %.1f s (%.3f s/token)\n",
+                one_batch ? "batched attn" : "chunked", np - reuse, dt_pf,
+                dt_pf / (np - reuse));
         step = np - 1;                 /* the prompt is done; lo is its last logits */
     }
 

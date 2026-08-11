@@ -153,9 +153,56 @@ readers from fighting the compute over the same cores.
 and this engine is exactly the case that justifies it: with I/O at 40 % of the
 time, a team spinning idle would steal cores from the work that matters.
 
+### 6. Prefill: batch the prompt, not the decode
+
+Decode batching loses (see below), and that led to the wrong conclusion for a
+while: that batching was settled. It is not — **prefill is a different problem**.
+The tokens of a prompt are all known at once, so there is no sequential
+dependency to break, and the win comes from the same expert union that decode
+cannot exploit.
+
+A 140-token prompt, one token at a time, was **202.4 s** and read **270.8 GB**.
+Batched it reads **76.9 GB** — 3.5x less — because a chunk of 140 rows visits
+each distinct expert once instead of once per row.
+
+Two paths, both measured on the same prompt:
+
+| prefill | TTFT | why |
+|---|---|---|
+| one token at a time | 202.4 s | baseline |
+| chunk 16 (9 chunks) | 190.2 s | little to amortize per chunk |
+| chunk 48 (3 chunks) | 181.4 s | |
+| **chunk 256 (1 chunk)** | **~157 s** | default |
+| one batch + batched attention | ~140 s | fastest, needs a fresh state |
+
+Batched attention is the faster of the two but it derives each token's RoPE
+position as `r % s`, so it assumes the batch starts at position 0: it is only
+valid for a whole prompt from an empty cache, and it costs ~416 KB per token, so
+it is capped (`DSV4_PREFILL_MAX`, 512). The chunked path has neither constraint —
+absolute positions, state maintained per token — so it works at any length and
+from any position, including after a reused prefix. **There is no length limit
+any more**; a 5k-token prompt is chunked, not decoded one token at a time.
+
+`DSV4_CHUNK` (default 256) bounds memory, not correctness: 5k tokens cost ~107 MB
+instead of ~2 GB. More chunks is slower, which is why the default is the largest
+chunk that stays cheap.
+
+Two things were verified rather than assumed. The harness checks
+`prefill == N sequential decodes` bit-for-bit at lengths 32/127/128/129/200/300
+(the window is 128 and the compressor ratio 4/128, so the interesting cases are
+around the block boundaries), and the seam test decodes 8 more tokens past the
+prompt to catch a state that is *nearly* right. On the engine, all four rows of
+the table above generate **identical text**.
+
+That last check earned its keep immediately: indexing the last row of the whole
+prompt instead of the last row of the current chunk read past the end of the
+buffer, and the symptom was not a crash but a *fluent wrong answer*.
+
 ## What did NOT work
 
-### Batching tokens (and with it MTP/DSpark)
+### Batching tokens at decode time (and with it MTP/DSpark)
+
+*This is about decode. Prefill batches and it wins -- finding 6.*
 
 It looked like the obvious lever. Consecutive tokens share experts, so a batch of
 5 asks for 724 distinct layer-experts instead of 5x258 = 1290: **1.78x fewer
@@ -331,8 +378,9 @@ All three modes generate **the same text**.
   mechanical USB disks, far slower than the NVMe, so splitting toward them would
   hurt unless the weights were made very asymmetric.
 - **What is NOT left**: memory-mapping (measured, loses), growing the cache
-  (measured, flat), batching tokens and MTP/DSpark (measured, loses). Each with
-  its reasoning above.
+  (measured, flat), batching tokens at *decode* time and MTP/DSpark (measured,
+  loses). Each with its reasoning above. Batching at *prefill* time is a
+  different question and it does work -- finding 6.
 - **Better overlap**: layer L+1's attention depends on layer L's MoE, so the
   `attn -> router -> read -> MoE` chain is inherently serial. The only overlap
   available is the one already done inside a layer.
