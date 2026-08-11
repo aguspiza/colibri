@@ -1078,8 +1078,50 @@ static void serve_loop(Run *R) {
     }
 }
 
+#ifdef _WIN32
+#include <shellapi.h>          /* CommandLineToArgvW */
+/* ---------------------------------------------------------------------------
+ * argv as UTF-8.
+ *
+ * Windows hands `argv` to the process in the ANSI codepage, not UTF-8. A prompt
+ * containing "España" arrives with `ñ` as the single byte 0xF1 (cp1252) instead
+ * of the two bytes C3 B1, which is not valid UTF-8. The tokenizer is byte-level
+ * BPE, so it does not reject it — it silently tokenizes the stray byte as its own
+ * piece, and generation degrades:
+ *
+ *   in:  "La capital de España es "   ->  the engine sees ...Espa\xF1a...
+ *   out: garbage bytes, then plausible text
+ *
+ * Reading the command line as UTF-16 and converting it ourselves is the only
+ * reliable fix; there is no codepage setting a caller can apply that makes the
+ * ANSI argv lossless for arbitrary text. SetConsoleOutputCP is the other half of
+ * the problem: without it, correct UTF-8 output still renders as mojibake.
+ * ------------------------------------------------------------------------- */
+static void win_argv_utf8(int *argc, char ***argv) {
+    int n = 0;
+    LPWSTR *w = CommandLineToArgvW(GetCommandLineW(), &n);
+    if (!w || n <= 0) return;
+    char **out = (char **)malloc((size_t)(n + 1) * sizeof(char *));
+    if (!out) { LocalFree(w); return; }
+    for (int i = 0; i < n; i++) {
+        const int len = WideCharToMultiByte(CP_UTF8, 0, w[i], -1, NULL, 0, NULL, NULL);
+        out[i] = (char *)malloc((size_t)(len > 0 ? len : 1));
+        if (len > 0) WideCharToMultiByte(CP_UTF8, 0, w[i], -1, out[i], len, NULL, NULL);
+        else out[i][0] = 0;
+    }
+    out[n] = NULL;
+    LocalFree(w);
+    *argc = n;
+    *argv = out;
+}
+#endif
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);   /* so our UTF-8 output renders, not mojibake */
+    win_argv_utf8(&argc, &argv);   /* see the note above: argv arrives as ANSI */
+#endif
 
     /* Size the OpenMP team to PHYSICAL cores, no SMT. Measured here: 19.0 s with
      * 16 logical threads against 17.1 s with 8 physical ones, and on top of that
