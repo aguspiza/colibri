@@ -76,6 +76,60 @@ static inline int dsv4_nblk(int n) {
  * `dequant()` in tools/convert_fp8_to_int4.py, which is the authoritative
  * reference for how these checkpoints are read at the source.
  */
+/* One block of e4m3 bytes -> floats. Shared by both nestings below. */
+static inline void dsv4_e4m3_block(float *w, const uint8_t *row, int len) {
+    int i = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256i k7F  = _mm256_set1_epi32(0x7F);
+    const __m256i k80  = _mm256_set1_epi32(0x80);
+    const __m256i kbia = _mm256_set1_epi32(120 << 23);
+    const __m256i k8   = _mm256_set1_epi32(8);
+    const __m256  ksub = _mm256_set1_ps(1.0f / 512.0f);
+    const __m256  knan = _mm256_set1_ps(NAN);
+    for (; i + 8 <= len; i += 8) {
+        const __m256i v =
+            _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(row + i)));
+        const __m256i mag = _mm256_and_si256(v, k7F);
+        const __m256i sgn = _mm256_slli_epi32(_mm256_and_si256(v, k80), 24);
+        const __m256  nrm = _mm256_castsi256_ps(
+            _mm256_add_epi32(_mm256_slli_epi32(mag, 20), kbia));
+        const __m256  sub = _mm256_mul_ps(_mm256_cvtepi32_ps(mag), ksub);
+        __m256 wv = _mm256_blendv_ps(nrm, sub,
+            _mm256_castsi256_ps(_mm256_cmpgt_epi32(k8, mag)));
+        wv = _mm256_blendv_ps(wv, knan,
+            _mm256_castsi256_ps(_mm256_cmpeq_epi32(mag, k7F)));
+        wv = _mm256_or_ps(wv, _mm256_castsi256_ps(sgn));
+        _mm256_storeu_ps(w + i, wv);
+    }
+#endif
+    for (; i < len; i++) w[i] = g_dsv4_e4m3[row[i]];
+}
+
+/* y[S,O] = x[S,I] @ W[O,I]^T
+ *
+ *   q8  : [O, I]                        raw e4m3 bytes
+ *   e8s : [ceil(O/128), ceil(I/128)]    UE8M0 scales (1 byte, 2^(e-127))
+ *
+ * The scale MULTIPLIES (it does not divide), same as colibri's fmt=8 path and as
+ * `dequant()` in tools/convert_fp8_to_int4.py.
+ *
+ * TWO NESTINGS, PICKED BY MEASUREMENT.
+ *
+ * Decode (S == 1) wants the weight bytes decoded straight into the dot product:
+ * there is no reuse to amortize, and staging them through a buffer costs a
+ * store/load round trip per block. Measured: staging made a 140-token sequential
+ * prefill go from 75.6 s of attention to 96.1 s.
+ *
+ * Prefill (S > 1) wants the opposite. With the input row on the outside a batch is
+ * S separate GEMVs, each re-reading all O*I weight bytes -- attention alone is
+ * 5.40 GB of them, so batching bought it almost nothing (1.17x). Hoisting the
+ * output row out and decoding each block ONCE for all S inputs cuts weight
+ * traffic by S: 64.5 s -> 55.8 s on the same prefill.
+ *
+ * Both nestings accumulate per (s,o) in the same order -- block by block, same
+ * partial sums, same scale application -- so they agree bit for bit and the
+ * choice cannot change a result.
+ */
 static inline void dsv4_matmul_fp8_ue8m0(float *y, const float *x,
                                          const uint8_t *q8, const uint8_t *e8s,
                                          int S, int I, int O)
@@ -83,12 +137,7 @@ static inline void dsv4_matmul_fp8_ue8m0(float *y, const float *x,
     dsv4_e4m3_init();
     const int nbi = dsv4_nblk(I);
 
-    for (int s = 0; s < S; s++) {
-        const float *xr = x + (size_t)s * I;
-        float *yr = y + (size_t)s * O;
-        /* Output rows are independent -- no reduction across them -- so the
-         * split is trivially correct. In decode S==1 and this is the only
-         * parallelism available. */
+    if (S == 1) {
 #ifdef _OPENMP
 #       pragma omp parallel for schedule(static) if (O >= 256)
 #endif
@@ -96,68 +145,97 @@ static inline void dsv4_matmul_fp8_ue8m0(float *y, const float *x,
             const uint8_t *row = q8 + (size_t)o * I;
             const uint8_t *sc = e8s + (size_t)(o / DSV4_FP8_BLOCK) * nbi;
             float acc = 0.0f;
-            /* Walked in 128-blocks along I: within a block the scale is
-             * constant, so it leaves the inner loop and the products accumulate
-             * with no extra multiplies. */
             for (int b = 0; b < nbi; b++) {
                 const int i0 = b * DSV4_FP8_BLOCK;
                 const int i1 = (i0 + DSV4_FP8_BLOCK < I) ? i0 + DSV4_FP8_BLOCK : I;
                 float part = 0.0f;
-                int i = i0;
+                int k = 0;
 #if defined(__AVX2__) && defined(__FMA__)
-                /* e4m3 -> f32 by ARITHMETIC, no table.
-                 *
-                 * The previous version used `_mm256_i32gather_ps` over the
-                 * 256-float LUT. It fits in L1, but on Zen 2 a gather executes
-                 * as 8 sequenced accesses and does not pipeline: that was why
-                 * this kernel managed 14 GFLOP/s while colibri's MXFP4 reaches
-                 * 33 on the same hardware.
-                 *
-                 * For exp != 0 it is pure bit shuffling: `mag << 20` puts the
-                 * mantissa in 22..20 and the exponent in 26..23, and adding
-                 * 120<<23 fixes the bias (e4m3 uses 7, f32 uses 127).
-                 * For exp == 0 the value is subnormal and equals mant * 2^-9,
-                 * which falls out of an int-to-float convert plus a scale.
-                 * `mag == 0x7F` is NaN under OCP E4M3-FN; the checkpoint holds
-                 * none (verified), but it is honoured anyway: if one ever shows
-                 * up, better it propagates than be read as 480. */
+                /* FUSED decode+FMA: with one input row there is nothing to
+                 * amortize, so the decoded weights must never touch memory.
+                 * Staging them through a buffer cost 75.6 -> 85.9 s of attention
+                 * on a sequential 140-token prefill. */
                 const __m256i k7F  = _mm256_set1_epi32(0x7F);
                 const __m256i k80  = _mm256_set1_epi32(0x80);
                 const __m256i kbia = _mm256_set1_epi32(120 << 23);
-                const __m256i k8   = _mm256_set1_epi32(8);
-                const __m256  ksub = _mm256_set1_ps(1.0f / 512.0f);   /* 2^-9 */
+                const __m256i k8c  = _mm256_set1_epi32(8);
+                const __m256  ksub = _mm256_set1_ps(1.0f / 512.0f);
                 const __m256  knan = _mm256_set1_ps(NAN);
                 __m256 va = _mm256_setzero_ps();
-                for (; i + 8 <= i1; i += 8) {
-                    const __m256i v =
-                        _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(row + i)));
+                for (; k + 8 <= i1 - i0; k += 8) {
+                    const __m256i v = _mm256_cvtepu8_epi32(
+                        _mm_loadl_epi64((const __m128i *)(row + i0 + k)));
                     const __m256i mag = _mm256_and_si256(v, k7F);
                     const __m256i sgn = _mm256_slli_epi32(_mm256_and_si256(v, k80), 24);
                     const __m256  nrm = _mm256_castsi256_ps(
                         _mm256_add_epi32(_mm256_slli_epi32(mag, 20), kbia));
                     const __m256  sub = _mm256_mul_ps(_mm256_cvtepi32_ps(mag), ksub);
                     __m256 wv = _mm256_blendv_ps(nrm, sub,
-                        _mm256_castsi256_ps(_mm256_cmpgt_epi32(k8, mag)));
+                        _mm256_castsi256_ps(_mm256_cmpgt_epi32(k8c, mag)));
                     wv = _mm256_blendv_ps(wv, knan,
                         _mm256_castsi256_ps(_mm256_cmpeq_epi32(mag, k7F)));
                     wv = _mm256_or_ps(wv, _mm256_castsi256_ps(sgn));
-                    va = _mm256_fmadd_ps(_mm256_loadu_ps(xr + i), wv, va);
+                    va = _mm256_fmadd_ps(_mm256_loadu_ps(x + i0 + k), wv, va);
                 }
-                {   /* horizontal sum */
+                {
                     __m128 lo = _mm256_castps256_ps128(va);
-                    __m128 hi = _mm256_extractf128_ps(va, 1);
-                    lo = _mm_add_ps(lo, hi);
+                    lo = _mm_add_ps(lo, _mm256_extractf128_ps(va, 1));
                     lo = _mm_hadd_ps(lo, lo);
                     lo = _mm_hadd_ps(lo, lo);
                     part = _mm_cvtss_f32(lo);
                 }
 #endif
-                for (; i < i1; i++)
-                    part += xr[i] * g_dsv4_e4m3[row[i]];
+                for (; k < i1 - i0; k++) part += x[i0 + k] * g_dsv4_e4m3[row[i0 + k]];
                 acc += part * g_dsv4_ue8m0[sc[b]];
             }
-            yr[o] = acc;
+            y[o] = acc;
         }
+        return;
+    }
+
+#ifdef _OPENMP
+#   pragma omp parallel for schedule(static) if (O >= 64)
+#endif
+    for (int o = 0; o < O; o++) {
+        const uint8_t *row = q8 + (size_t)o * I;
+        const uint8_t *sc = e8s + (size_t)(o / DSV4_FP8_BLOCK) * nbi;
+
+        float acc_s[64];
+        float *acc = (S <= 64) ? acc_s : (float *)malloc((size_t)S * sizeof(float));
+        for (int s = 0; s < S; s++) acc[s] = 0.0f;
+
+        float wbuf[DSV4_FP8_BLOCK];
+        for (int b = 0; b < nbi; b++) {
+            const int i0 = b * DSV4_FP8_BLOCK;
+            const int i1 = (i0 + DSV4_FP8_BLOCK < I) ? i0 + DSV4_FP8_BLOCK : I;
+            const int len = i1 - i0;
+            dsv4_e4m3_block(wbuf, row + i0, len);      /* once for all S inputs */
+            const float scale = g_dsv4_ue8m0[sc[b]];
+
+            for (int s = 0; s < S; s++) {
+                const float *xr = x + (size_t)s * I + i0;
+                float part = 0.0f;
+                int k = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+                __m256 va = _mm256_setzero_ps();
+                for (; k + 8 <= len; k += 8)
+                    va = _mm256_fmadd_ps(_mm256_loadu_ps(xr + k),
+                                         _mm256_loadu_ps(wbuf + k), va);
+                {
+                    __m128 lo = _mm256_castps256_ps128(va);
+                    lo = _mm_add_ps(lo, _mm256_extractf128_ps(va, 1));
+                    lo = _mm_hadd_ps(lo, lo);
+                    lo = _mm_hadd_ps(lo, lo);
+                    part = _mm_cvtss_f32(lo);
+                }
+#endif
+                for (; k < len; k++) part += xr[k] * wbuf[k];
+                acc[s] += part * scale;
+            }
+        }
+
+        for (int s = 0; s < S; s++) y[(size_t)s * O + o] = acc[s];
+        if (acc != acc_s) free(acc);
     }
 }
 
