@@ -290,6 +290,35 @@ Note that `DSV4_MAX_SEQ` must be the same when building and when serving: it is 
 of the fingerprint, so a mismatch is rejected -- correctly, but at the cost of the
 whole build.
 
+**The arrays are trimmed to what was written, and that buys more than size.** The
+compressed entries are written at `win + start_pos/ratio`, i.e. a prefix at a fixed
+offset, so storing only that prefix makes a snapshot **portable across
+`DSV4_MAX_SEQ`** -- the offset does not move when max_seq changes, only the array's
+total length. So max_seq left the fingerprint, and raising the context later (the
+model allows 262144) neither multiplies the files by 8 nor invalidates the cache.
+Verified by building at 8192 and loading at 16384: same text, and both equal to a
+cold run.
+
+The size now follows the position: 24.4 / 25.2 / 25.4 MB for checkpoints at 64 / 128
+/ 140 tokens, against a flat 136 MB before. A checkpoint at `p` costs ~20 MB fixed
+(the window ring and the in-progress blocks) plus ~13.5 KB per token, so the series
+for interval N over T tokens is proportional to T squared over 2N -- halving N
+doubles the disk. It does not make fine-grained checkpointing cheaper, it makes it
+possible: 19 checkpoints over 19701 tokens is 3.3 GB trimmed, against 8.7 GB at
+max_seq 32768 and 70 GB at 262144. (Deltas would fix the redundancy -- the
+compressed region is append-only, so only ~20 MB per checkpoint is genuinely new --
+and are not implemented.)
+
+**The trimming shipped broken first, and only one kind of test caught it.** The used
+count came from `st->n_written`, which is assigned solely in
+`dsv4_state_seed_from_prefill` and read nowhere, so on the per-token path -- the one
+the offline builder uses -- it stays 0 and every compressed entry was trimmed away.
+The restored state still produced a plausible first word from the window alone and
+diverged one token later. The portability check passed the whole time: the cache was
+self-consistent, just wrong. Only comparing restored output against a **cold run**
+found it, and the giveaway in hindsight is that all three files were byte-identical
+in size.
+
 Two failure modes are handled rather than hoped about: the file is written to
 `.part` and renamed only when complete, so a kill during a 0.46 GB write cannot
 leave something the next start would load as valid; and the fingerprint

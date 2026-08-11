@@ -901,30 +901,59 @@ static void run_reset(Run *R) {
  * attention state, the position, and the token history that prefix reuse compares
  * against. `h`/`h2` are scratch, rebuilt on every step.
  *
- * Measured: 0.14 GB at DSV4_MAX_SEQ=8192, so ~0.5 GB at 32768. The size follows
- * max_seq, NOT the number of tokens, because that is how the arrays are
- * allocated -- a checkpoint at token 2000 costs the same as one at 20000. It
- * reloads in 0.1 s, against 4.5 h of prefill.
+ * The arrays are trimmed to what has actually been written (see state_blobs), so
+ * the size follows the TOKEN COUNT and not max_seq: a checkpoint is portable to a
+ * larger context, and raising DSV4_MAX_SEQ to the model's 262144 neither multiplies
+ * the file by 8 nor invalidates it. It reloads in 0.1 s, against hours of prefill.
  * ------------------------------------------------------------------------- */
 #define SNAP_MAGIC "DSV4SNP1"
 #define SNAP_MAX_BLOBS 6
 
 typedef struct { void *p; size_t n; } Blob;
 
+/* Compressed entries actually written after `ntok` tokens have been fed.
+ *
+ * dsv4_attention_decode writes entry `start_pos / ratio` (at kv offset
+ * `win + that`, and at i_kv offset `that`) for start_pos in [0, ntok), so the
+ * written entries are a PREFIX starting at a fixed offset and everything past it is
+ * still the zero calloc left.
+ *
+ * `ntok` comes from Run.pos, NOT from st->n_written. That field is assigned only in
+ * dsv4_state_seed_from_prefill and read nowhere, so on the per-token path -- the one
+ * the offline builder uses -- it stays 0. Trusting it trimmed away every compressed
+ * entry: the window alone still produced a plausible first word, and the answer
+ * diverged one token later. Caught by comparing restored output against a cold run,
+ * which is the only check that could have caught it. */
+static int state_used(const DsV4AttnState *st, int ntok) {
+    if (!st->ratio || ntok <= 0) return 0;
+    return (ntok - 1) / st->ratio + 1;
+}
+
 /* The state's arrays listed in ONE place, so save and load cannot disagree about
- * the layout. The sizes mirror dsv4_state_init_full. */
-static int state_blobs(DsV4AttnState *st, Blob *b)
+ * the layout. The sizes mirror dsv4_state_init_full, except that the two arrays
+ * dimensioned by max_seq are cut to the part that has been written.
+ *
+ * That is what makes a snapshot ~10x smaller AND portable across DSV4_MAX_SEQ: the
+ * written prefix sits at the same offset whatever max_seq is -- only the array's
+ * total length changes, and the tail is zero on both sides. Without it, raising
+ * max_seq to the model's 262144 would multiply every checkpoint by 8 for no gain
+ * and invalidate the cache for nothing.
+ *
+ * With b > 1 the written part is not a contiguous prefix, so the full arrays are
+ * written. Both sides read st->b, so they agree either way. */
+static int state_blobs(DsV4AttnState *st, int ntok, Blob *b)
 {
-    const size_t ring = (size_t)st->b * (st->win + st->ncomp) * st->hd;
-    const size_t ks   = (size_t)st->b * st->coff * st->ratio * st->coff * st->hd;
-    const size_t is   = (size_t)st->b * st->coff * st->ratio * st->coff * st->i_hd;
+    const int used  = (st->b == 1) ? state_used(st, ntok) : st->ncomp;
+    const size_t ks = (size_t)st->b * st->coff * st->ratio * st->coff * st->hd;
+    const size_t is = (size_t)st->b * st->coff * st->ratio * st->coff * st->i_hd;
     int n = 0;
-    b[n].p = st->kv;                    b[n++].n = ring * sizeof(float);
+    b[n].p = st->kv;
+    b[n++].n = (size_t)st->b * (st->win + used) * st->hd * sizeof(float);
     if (st->ratio) {
         b[n].p = st->kv_state;          b[n++].n = ks * sizeof(float);
         b[n].p = st->score_state;       b[n++].n = ks * sizeof(float);
         if (st->i_hd) {
-            b[n].p = st->i_kv;          b[n++].n = (size_t)st->b * st->ncomp
+            b[n].p = st->i_kv;          b[n++].n = (size_t)st->b * used
                                                    * st->i_hd * sizeof(float);
             b[n].p = st->i_kv_state;    b[n++].n = is * sizeof(float);
             b[n].p = st->i_score_state; b[n++].n = is * sizeof(float);
@@ -933,11 +962,14 @@ static int state_blobs(DsV4AttnState *st, Blob *b)
     return n;
 }
 
-/* Loading a snapshot built for another model, or another DSV4_MAX_SEQ, would read
- * the right number of bytes into differently shaped arrays -- silently. */
+/* Loading a snapshot built for another MODEL would read the right number of bytes
+ * into differently shaped arrays -- silently. max_seq is deliberately NOT here:
+ * since the arrays are trimmed to the written prefix, a snapshot is valid at any
+ * max_seq large enough to hold it, which is checked per layer instead. That is what
+ * lets the context be raised later without paying the prefill again. */
 static void snap_fingerprint(Model *M, int32_t *fp) {
-    fp[0] = M->n_layers; fp[1] = M->max_seq; fp[2] = M->dim;
-    fp[3] = M->vocab;    fp[4] = M->hc;
+    fp[0] = M->n_layers; fp[1] = M->dim; fp[2] = M->vocab;
+    fp[3] = M->hc;       fp[4] = 0;
 }
 
 static int snap_save(Run *R, const char *path)
@@ -957,11 +989,12 @@ static int snap_save(Run *R, const char *path)
               || fwrite(R->hist, sizeof(int) * (size_t)R->nhist, 1, f) == 1);
     for (int L = 0; ok && L < M->n_layers; L++) {
         DsV4AttnState *st = &R->st[L];
-        const int32_t sc[8] = { st->b, st->hd, st->win, st->ncomp,
-                                st->ratio, st->coff, st->i_hd, st->n_written };
+        const int32_t sc[8] = { st->b, st->hd, st->win, st->ratio,
+                                st->coff, st->i_hd, R->pos,
+                                state_used(st, R->pos) };
         ok = fwrite(sc, sizeof sc, 1, f) == 1;
         Blob b[SNAP_MAX_BLOBS];
-        const int nb = state_blobs(st, b);
+        const int nb = state_blobs(st, R->pos, b);
         for (int i = 0; ok && i < nb; i++)
             if (b[i].n && fwrite(b[i].p, b[i].n, 1, f) != 1) ok = 0;
     }
@@ -1016,16 +1049,24 @@ static int snap_load(Run *R, const char *path, const int *ids, int np)
     for (int L = 0; ok && L < M->n_layers; L++) {
         DsV4AttnState *st = &R->st[L];
         int32_t sc[8];
-        const int32_t want[7] = { st->b, st->hd, st->win, st->ncomp,
+        const int32_t want[6] = { st->b, st->hd, st->win,
                                   st->ratio, st->coff, st->i_hd };
         if (fread(sc, sizeof sc, 1, f) != 1 || memcmp(sc, want, sizeof want) != 0) {
             ok = 0; break;
         }
+        /* The one thing max_seq still has to satisfy: room for the written part. */
+        if (sc[7] > st->ncomp) {
+            fprintf(stderr, "[snap] layer %d needs %d compressed entries, this "
+                            "DSV4_MAX_SEQ gives %d\n", L, sc[7], st->ncomp);
+            ok = 0; break;
+        }
         Blob b[SNAP_MAX_BLOBS];
-        const int nb = state_blobs(st, b);
+        const int nb = state_blobs(st, sc[6], b);
         for (int i = 0; ok && i < nb; i++)
             if (b[i].n && fread(b[i].p, b[i].n, 1, f) != 1) ok = 0;
-        st->n_written = sc[7];
+        /* Leave the field saying what the seeding path would have left, even though
+         * nothing reads it -- a stale 0 here is what caused the trimming bug. */
+        st->n_written = sc[6];
     }
     fclose(f);
     if (!ok) {
