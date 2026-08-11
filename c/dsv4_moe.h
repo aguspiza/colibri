@@ -135,6 +135,57 @@ static inline void dsv4_expert_apply(const DsV4MoeCfg *c,
     free(gate); free(up); free(h); free(outv);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * The same expert, applied to SEVERAL rows at once.
+ *
+ * `dsv4_expert_apply` runs one row, so the union loop below used to call it once
+ * per (expert, row) pair -- every call a GEMV that re-walks the expert's weights.
+ * colibri's matmul_mxfp4 is already nested the right way for this (output row
+ * outside, batch row inside, so an output row's ~2 KB of weights stay in L1
+ * across the batch), it was simply never given more than one row.
+ *
+ * `rows[]` lists which rows of `x` selected this expert and `wk[]` their routing
+ * weights. Each row's accumulation order is unchanged -- experts still arrive in
+ * union order and the weight still multiplies the intermediate before w2 -- so
+ * this agrees bit for bit with the per-row version.
+ * ------------------------------------------------------------------------- */
+static inline void dsv4_expert_apply_rows(const DsV4MoeCfg *c,
+                                          const DsV4W *w1, const DsV4W *w2,
+                                          const DsV4W *w3,
+                                          const float *x, int64_t dim_stride,
+                                          const int *rows, const float *wk,
+                                          int nr, float *acc, int64_t acc_stride)
+{
+    if (nr <= 0) return;
+    const int inter = c->inter, dim = c->dim;
+    float *xg   = (float *)malloc((size_t)nr * dim * sizeof(float));
+    float *gate = (float *)malloc((size_t)nr * inter * sizeof(float));
+    float *up   = (float *)malloc((size_t)nr * inter * sizeof(float));
+    float *h    = (float *)malloc((size_t)nr * inter * sizeof(float));
+    float *outv = (float *)malloc((size_t)nr * dim * sizeof(float));
+
+    for (int i = 0; i < nr; i++)
+        memcpy(xg + (size_t)i * dim, x + (size_t)rows[i] * dim_stride,
+               (size_t)dim * sizeof(float));
+
+    dsv4_matmul_w(gate, xg, w1, nr, 1);
+    dsv4_matmul_w(up,   xg, w3, nr, 1);
+    for (int i = 0; i < nr; i++)
+        for (int k = 0; k < inter; k++) {
+            const size_t j = (size_t)i * inter + k;
+            h[j] = dsv4_to_bf16(wk[i] * dsv4_swiglu(gate[j], up[j], c->swiglu_limit));
+        }
+    dsv4_matmul_w(outv, h, w2, nr, 1);
+    for (int i = 0; i < nr; i++) {
+        float *dst = acc + (size_t)rows[i] * acc_stride;
+        const float *src = outv + (size_t)i * dim;
+        for (int d = 0; d < dim; d++) dst[d] += src[d];
+    }
+
+    free(xg); free(gate); free(up); free(h); free(outv);
+}
+
 /* ---------------------------------------------------------------------------
  * The complete MoE block.
  *
@@ -183,6 +234,10 @@ static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
      * bits. */
     const int64_t nslots = rows * c->topk;
     int *uniq = (int *)malloc((size_t)nslots * sizeof(int));
+    /* A row can select the same expert more than once on a hash layer, so the
+     * per-expert row list is sized for the worst case, not for `rows`. */
+    int *erow = (int *)malloc((size_t)nslots * sizeof(int));
+    float *ewk = (float *)malloc((size_t)nslots * sizeof(float));
     int nu = 0;
     for (int64_t i = 0; i < nslots; i++) {
         int seen = 0;
@@ -208,14 +263,23 @@ static inline void dsv4_moe_forward(const DsV4MoeCfg *c, const DsV4MoeW *w,
             w1 = w->e_w1[e]; w2 = w->e_w2[e]; w3 = w->e_w3[e];
         }
         /* It is in RAM now: spend it on every row that asked for it before the
-         * cache can evict it. That is the whole point of the union. */
+         * cache can evict it. That is the whole point of the union.
+         *
+         * The rows are collected first and applied as ONE batch: with rows == 1
+         * this is the same single call as before, and with a prefill chunk it is
+         * what lets the expert's weights be walked once instead of once per row. */
+        int nr = 0;
         for (int64_t r = 0; r < rows; r++)
             for (int k = 0; k < c->topk; k++)
-                if (idx[r * c->topk + k] == e)
-                    dsv4_expert_apply(c, &w1, &w2, &w3, x + r * c->dim,
-                                      wt[r * c->topk + k], out + r * c->dim);
+                if (idx[r * c->topk + k] == e) {
+                    erow[nr] = (int)r;
+                    ewk[nr] = wt[r * c->topk + k];
+                    nr++;
+                }
+        dsv4_expert_apply_rows(c, &w1, &w2, &w3, x, c->dim, erow, ewk, nr,
+                               out, c->dim);
     }
-    free(uniq);
+    free(uniq); free(erow); free(ewk);
 
     /* The shared expert ALWAYS runs, with weight 1, after the routed ones. */
     for (int64_t r = 0; r < rows; r++)
