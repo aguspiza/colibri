@@ -250,6 +250,32 @@ At the measured 1.12 s/token the interval is a straight trade: 4096 -> at most
 76 min re-prefilled on a divergence, 2048 -> 38 min at twice the files. Five
 checkpoints for a 20k prompt is ~2.3 GB.
 
+**The runbook, and why it cuts at the system boundary.** The prompt is captured by
+the engine (`DSV4_DUMP_PROMPT`) rather than by the gateway, because that is the only
+place the exact bytes the tokenizer sees are available -- a renderer difference of
+one token would be a silent miss after hours of work. Then:
+
+```
+python3 dsv4_cut_prompt.py captured.txt system.txt        # cut + verify
+BUILD_CACHE=1 SNAP=<model> DSV4_PROMPT_FILE=system.txt   DSV4_CACHE_DIR=cache DSV4_MAX_SEQ=32768 DSV4_CKPT_EVERY=4096 deepseek_v4
+```
+
+Caching the whole first request would diverge the moment a new session opens with a
+different first message -- at token ~20000, costing a full interval. Cutting at the
+first `<｜User｜>` caches the system prompt alone, so every future session hits from
+token 0. Measured on the real agent prompt: 20249 tokens in total, 20243 of them the
+system, so 6 tokens are all that is left to prefill per session.
+
+That cut is safe for a specific reason: `<｜User｜>` is an added token, treated as
+atomic by pre-tokenization, so no BPE merge spans the boundary and the truncated
+text's tokens are a true prefix. That is NOT true of an arbitrary character offset,
+so the script verifies it instead of assuming it. (It also spells the marker with
+FULLWIDTH VERTICAL LINE, U+FF5C -- the ASCII `<|User|>` never matches.)
+
+Note that `DSV4_MAX_SEQ` must be the same when building and when serving: it is part
+of the fingerprint, so a mismatch is rejected -- correctly, but at the cost of the
+whole build.
+
 Two failure modes are handled rather than hoped about: the file is written to
 `.part` and renamed only when complete, so a kill during a 0.46 GB write cannot
 leave something the next start would load as valid; and the fingerprint
