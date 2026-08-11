@@ -452,11 +452,16 @@ single right answer for every machine**. The same applies here.
 
 Measured over 14 tokens, averaging two passes:
 
-| `DSV4_LOAD` | private | working set | system free | time |
-|---|---|---|---|---|
-| `read` (default) | 13.2 GB | 13.2 GB | 8.2 GB | **19.3 s** |
-| `dense` | **5.4 GB** | 12.2 GB | 8.4 GB | 21.5 s |
-| `all` | **0.6 GB** | 24.7 GB | 0.6 GB | 24.4 s |
+| `DSV4_LOAD` | private | working set | time |
+|---|---|---|---|
+| `read` (default) | 13.2 GB | 13.2 GB | **19.3 s** |
+| `dense` | **5.4 GB** | 12.2 GB | 21.5 s |
+| `all` | **0.6 GB** | 24.7 GB | 24.4 s |
+
+("system free" is deliberately not a column. During the long prefill it read 1.1 GB
+in *both* `read` and `dense`, which says nothing: in one case the shortfall is
+anonymous memory that can only be relieved by swapping, in the other it is
+file-backed pages the OS drops instantly. Free memory was never the metric.)
 
 - **`read`** — everything through `pread` into private buffers. Fastest.
 - **`dense`** — maps the dense set (attention, `embed`, `lm_head`, shared
@@ -477,10 +482,57 @@ that mapping **increased** consumption (24.9 GB), because touched file pages
 count toward the process working set. For "how much RAM does this process need"
 the number to read is **private bytes**.
 
-The second llama.cpp axis, residency (`mlock` / `VirtualLock`), is not
-implemented. It matters little here: the dense set is touched on every token, so
-it stays resident on its own, and pinning it on Windows means adjusting the
-process working-set quota.
+### Mapping is not just lazy loading -- it is accepting the OS's eviction policy
+
+The virtual address space is free in the literal sense: 156 GB of it costs nothing
+on 64-bit, and pages that are never touched are never read. But that is not the
+whole price. Mapping a page also hands the OS the decision of **when to take it out
+of physical RAM**, and the OS does not know our access pattern.
+
+That reframes what `dense` does, and not in its favour. The dense set is the one
+population we know with certainty: it is needed on *every single token*, forever.
+`dense` takes precisely that -- the thing with no uncertainty in it -- and makes it
+evictable, in order to save private bytes. It is backwards. The population that
+*should* be left to the OS is the routed experts: 137 GB, uncertain, and measured
+flat (see "Growing the expert cache").
+
+Measured during a 19701-token prefill in `dense` mode, the loss did not
+materialize: the working set sat at 11.39 GB and grew by ~1 MB over 30 s, so the OS
+was keeping the mapped dense pages resident. The point is that this holds only while
+nothing else asks for RAM. It is a hope about policy, not a property of the design.
+
+**So the second llama.cpp axis, residency (`mlock` / `VirtualLock`), is the missing
+piece rather than a detail.** The earlier note here said it "matters little,
+because the dense set is touched on every token, so it stays resident on its own" --
+that is the hope, stated as if it were a guarantee. Mapping *and pinning* the dense
+ranges is the configuration `dense` is trying to be: file-backed (no commit charge,
+never written to the page file) **and** never evicted (no policy delegated). On
+Windows it means raising the process working-set quota, which is why it is not free
+to add, not why it does not matter.
+
+### The asymmetry, which is the general rule
+
+The useful question is never "mmap or not". It is **whether our information beats
+the OS's** for that population:
+
+| population | what we know | who should decide |
+|---|---|---|
+| routed experts (137 GB) | the router looks **one layer** ahead, and that margin is already spent on the prefetch pool | the OS -- and measured flat, so nothing is lost |
+| dense set (8.67 GB) | needed on every token, with certainty | **us** -- never cede this one |
+
+The expert side is not a concession, it is a measurement: our LRU turned out to be
+redundant with the page cache (time flat 20.0-21.9 s while bytes read varied 2.3x,
+at 4.9 GB/s effective against 2.9 GB/s from disk). There is no long horizon to
+exploit, because layer L's routing depends on layer L-1's output.
+
+The dense side needs no measurement at all, which is exactly why ceding it is the
+mistake.
+
+A related trap, for completeness: comparing `read` and `dense` by CPU-seconds per
+wall-second **does not work**, because attention cost grows with sequence position,
+so two samples taken at different points in the same prefill are not comparable
+even for identical configurations. The valid comparison is s/token over the same
+token range.
 
 All three modes generate **the same text**.
 
