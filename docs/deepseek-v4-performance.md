@@ -256,21 +256,35 @@ place the exact bytes the tokenizer sees are available -- a renderer difference 
 one token would be a silent miss after hours of work. Then:
 
 ```
-python3 dsv4_cut_prompt.py captured.txt system.txt        # cut + verify
-BUILD_CACHE=1 SNAP=<model> DSV4_PROMPT_FILE=system.txt   DSV4_CACHE_DIR=cache DSV4_MAX_SEQ=32768 DSV4_CKPT_EVERY=4096 deepseek_v4
+python3 dsv4_cut_prompt.py captured.txt stable.txt       # cut + verify
+BUILD_CACHE=1 SNAP=<model> DSV4_PROMPT_FILE=stable.txt   DSV4_CACHE_DIR=cache DSV4_MAX_SEQ=32768 DSV4_CKPT_EVERY=4096 deepseek_v4
 ```
 
-Caching the whole first request would diverge the moment a new session opens with a
-different first message -- at token ~20000, costing a full interval. Cutting at the
-first `<｜User｜>` caches the system prompt alone, so every future session hits from
-token 0. Measured on the real agent prompt: 20249 tokens in total, 20243 of them the
-system, so 6 tokens are all that is left to prefill per session.
+**The cache can only extend to the first thing that changes between sessions**, and
+finding that is the whole game. Two candidates, both measured on the real agent
+prompt (20249 tokens):
 
-That cut is safe for a specific reason: `<｜User｜>` is an added token, treated as
-atomic by pre-tokenization, so no BPE merge spans the boundary and the truncated
-text's tokens are a true prefix. That is NOT true of an arbitrary character offset,
-so the script verifies it instead of assuming it. (It also spells the marker with
-FULLWIDTH VERTICAL LINE, U+FF5C -- the ASCII `<|User|>` never matches.)
+| cut at | cached | left per session |
+|---|---|---|
+| first `<｜User｜>` (end of system) | 20243 (99.97 %) | 6 tokens |
+| `Today is <date> ... directory is '<cwd>'` | **19701 (97.3 %)** | 548 tokens, ~10 min |
+
+The first one looks better and is wrong: that line is volatile every single day, so
+a cache built past it **expires at midnight**. It sits at token 19701, 97.3 % of the
+way in, so cutting before it costs 2.7 % of the prefill and buys a cache that does
+not. Everything stable that happens to sit after it -- here a `<critical>` block --
+is unreachable, which is what a prefix means, not an oversight.
+
+That was caught by reading the captured prompt, not by the machinery: nothing in the
+engine can tell a stable token from a volatile one.
+
+The cut is verified rather than assumed, because a byte offset is not necessarily a
+token boundary and byte-level BPE merges can span it. The role marker happens to be
+safe (it is an added token, atomic to pre-tokenization); `Today is` is not
+guaranteed to be, so the script checks that the truncated text's tokens are a true
+prefix and walks the offset backwards until they are. A silent mismatch would only
+surface after hours of prefill. (Note the marker is spelled with FULLWIDTH VERTICAL
+LINE, U+FF5C: the ASCII `<|User|>` never matches.)
 
 Note that `DSV4_MAX_SEQ` must be the same when building and when serving: it is part
 of the fingerprint, so a mismatch is rejected -- correctly, but at the cost of the
