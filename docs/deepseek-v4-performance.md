@@ -198,6 +198,65 @@ That last check earned its keep immediately: indexing the last row of the whole
 prompt instead of the last row of the current chunk read past the end of the
 buffer, and the symptom was not a crash but a *fluent wrong answer*.
 
+### 7. The prompt cache: pay the prefill once, ever
+
+Finding 6 took a 20k-token prompt from "impossible" to ~4.5 h. That is still not a
+usable agent backend, and no engineering fixes it: 13B active parameters is
+~26 GFLOP per token against the 31-35 GFLOP/s these kernels reach, so ~0.8 s/token
+is the floor with infinite RAM and infinite disk. 20265 tokens is hours by
+arithmetic.
+
+But it is the SAME prefill every session. So it is paid once and kept.
+
+`DSV4_CACHE_DIR` holds snapshots of the state that decoding actually reads: the
+per-layer attention arrays, the position, and the token history prefix reuse
+compares against (`h`/`h2` are scratch). Measured on a 140-token prompt:
+
+| | TTFT | text |
+|---|---|---|
+| cold | 177.0 s | `' Berlin.'` |
+| restored | **3.0 s** | `' Berlin.'` |
+
+The snapshot is 0.136 GB at `DSV4_MAX_SEQ=8192` and reloads in 0.1 s. **Its size
+follows max_seq, not the number of tokens**, because that is how the arrays are
+allocated -- a checkpoint at token 2000 costs the same as one at 20000 (~0.46 GB
+at 32768).
+
+**Checkpoints, because our state cannot be rewound.** The compressors and the
+indexer accumulate an in-progress block that cannot be un-accumulated, so a prompt
+that diverges from the cached one at token 15000 cannot use a 20000-token snapshot
+*at all*. `DSV4_CKPT_EVERY` (4096) writes one every N tokens and the deepest one
+that is still a prefix wins:
+
+| divergent prompt | prefill | TTFT | text |
+|---|---|---|---|
+| no cache | 83 tokens | 95.3 s | `' Roma.'` |
+| checkpoint at 64 | 19 tokens | **27.4 s** | `' Roma.'` |
+
+llama.cpp added `--ctx-checkpoints` for the same reason: an SWA state cannot be
+rolled back either. Two things were taken from its design and one was not: the key
+is an exact token comparison (its `get_common_prefix`), the store is a set of
+entries picked by depth -- but there is no hash. With one candidate at a time and
+80 KB of ids there is nothing to optimize, and a collision would produce wrong
+output silently; reading the ids first and the 0.46 GB of arrays only on a match
+does the same job without that risk. (llama.cpp does not hash tokens either; its
+FNV-1a is for image bitmaps.)
+
+Chunking cost nothing to add: `run_prefill` already takes an absolute start
+position and maintains the state itself, so a slice is the same work as the
+equivalent stretch of one long call.
+
+At the measured 1.12 s/token the interval is a straight trade: 4096 -> at most
+76 min re-prefilled on a divergence, 2048 -> 38 min at twice the files. Five
+checkpoints for a 20k prompt is ~2.3 GB.
+
+Two failure modes are handled rather than hoped about: the file is written to
+`.part` and renamed only when complete, so a kill during a 0.46 GB write cannot
+leave something the next start would load as valid; and the fingerprint
+(layers, max_seq, dim, vocab, hc) is checked, because a snapshot from another
+`DSV4_MAX_SEQ` would read the right number of bytes into differently shaped
+arrays -- silently.
+
 ## What did NOT work
 
 ### Batching tokens at decode time (and with it MTP/DSpark)

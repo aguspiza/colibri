@@ -888,6 +888,240 @@ static void run_reset(Run *R) {
     R->nhist = 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * PROMPT CACHE (a state snapshot on disk).
+ *
+ * A 20k-token system prompt is ~4.5 h of prefill on this machine, and the FLOP
+ * roofline says nothing will make it cheap: 13B active parameters is ~26 GFLOP
+ * per token against the 31-35 GFLOP/s these kernels reach. But it is the SAME
+ * prefill every session, so the answer is to pay it once and keep the result.
+ * llama.cpp keeps --prompt-cache for exactly this.
+ *
+ * What has to persist is precisely what the decode loop reads: the per-layer
+ * attention state, the position, and the token history that prefix reuse compares
+ * against. `h`/`h2` are scratch, rebuilt on every step.
+ *
+ * Measured: 0.14 GB at DSV4_MAX_SEQ=8192, so ~0.5 GB at 32768. The size follows
+ * max_seq, NOT the number of tokens, because that is how the arrays are
+ * allocated -- a checkpoint at token 2000 costs the same as one at 20000. It
+ * reloads in 0.1 s, against 4.5 h of prefill.
+ * ------------------------------------------------------------------------- */
+#define SNAP_MAGIC "DSV4SNP1"
+#define SNAP_MAX_BLOBS 6
+
+typedef struct { void *p; size_t n; } Blob;
+
+/* The state's arrays listed in ONE place, so save and load cannot disagree about
+ * the layout. The sizes mirror dsv4_state_init_full. */
+static int state_blobs(DsV4AttnState *st, Blob *b)
+{
+    const size_t ring = (size_t)st->b * (st->win + st->ncomp) * st->hd;
+    const size_t ks   = (size_t)st->b * st->coff * st->ratio * st->coff * st->hd;
+    const size_t is   = (size_t)st->b * st->coff * st->ratio * st->coff * st->i_hd;
+    int n = 0;
+    b[n].p = st->kv;                    b[n++].n = ring * sizeof(float);
+    if (st->ratio) {
+        b[n].p = st->kv_state;          b[n++].n = ks * sizeof(float);
+        b[n].p = st->score_state;       b[n++].n = ks * sizeof(float);
+        if (st->i_hd) {
+            b[n].p = st->i_kv;          b[n++].n = (size_t)st->b * st->ncomp
+                                                   * st->i_hd * sizeof(float);
+            b[n].p = st->i_kv_state;    b[n++].n = is * sizeof(float);
+            b[n].p = st->i_score_state; b[n++].n = is * sizeof(float);
+        }
+    }
+    return n;
+}
+
+/* Loading a snapshot built for another model, or another DSV4_MAX_SEQ, would read
+ * the right number of bytes into differently shaped arrays -- silently. */
+static void snap_fingerprint(Model *M, int32_t *fp) {
+    fp[0] = M->n_layers; fp[1] = M->max_seq; fp[2] = M->dim;
+    fp[3] = M->vocab;    fp[4] = M->hc;
+}
+
+static int snap_save(Run *R, const char *path)
+{
+    Model *M = R->M;
+    char part[1200];
+    snprintf(part, sizeof part, "%s.part", path);
+    FILE *f = fopen(part, "wb");
+    if (!f) { fprintf(stderr, "[snap] cannot write %s\n", part); return 0; }
+
+    int32_t fp[5];  snap_fingerprint(M, fp);
+    const int32_t head[2] = { R->pos, R->nhist };
+    int ok = fwrite(SNAP_MAGIC, 8, 1, f) == 1
+          && fwrite(fp, sizeof fp, 1, f) == 1
+          && fwrite(head, sizeof head, 1, f) == 1
+          && (R->nhist == 0
+              || fwrite(R->hist, sizeof(int) * (size_t)R->nhist, 1, f) == 1);
+    for (int L = 0; ok && L < M->n_layers; L++) {
+        DsV4AttnState *st = &R->st[L];
+        const int32_t sc[8] = { st->b, st->hd, st->win, st->ncomp,
+                                st->ratio, st->coff, st->i_hd, st->n_written };
+        ok = fwrite(sc, sizeof sc, 1, f) == 1;
+        Blob b[SNAP_MAX_BLOBS];
+        const int nb = state_blobs(st, b);
+        for (int i = 0; ok && i < nb; i++)
+            if (b[i].n && fwrite(b[i].p, b[i].n, 1, f) != 1) ok = 0;
+    }
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        remove(part);
+        fprintf(stderr, "[snap] write failed; snapshot discarded rather than left "
+                        "half-written\n");
+        return 0;
+    }
+    /* Rename only once it is complete. A kill in the middle of a 1.7 GB write must
+     * never leave behind a file that the next start would load as valid. */
+    remove(path);
+    if (rename(part, path) != 0) { remove(part); return 0; }
+    return 1;
+}
+
+/* Returns how many tokens were restored, or 0 (state untouched, or reset). */
+static int snap_load(Run *R, const char *path, const int *ids, int np)
+{
+    Model *M = R->M;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    char magic[8];
+    int32_t fp[5], head[2], mine[5];
+    snap_fingerprint(M, mine);
+    if (fread(magic, 8, 1, f) != 1 || memcmp(magic, SNAP_MAGIC, 8) != 0
+        || fread(fp, sizeof fp, 1, f) != 1 || memcmp(fp, mine, sizeof fp) != 0
+        || fread(head, sizeof head, 1, f) != 1) {
+        fprintf(stderr, "[snap] %s is not a snapshot for this model/DSV4_MAX_SEQ; "
+                        "ignored\n", path);
+        fclose(f); return 0;
+    }
+    const int pos = head[0], nh = head[1];
+    /* nh >= np would leave no token to feed, which is the same condition the
+     * in-memory prefix reuse enforces. */
+    if (nh <= 0 || nh > R->hcap || nh >= np) { fclose(f); return 0; }
+
+    /* PHASE 1: the history alone. A snapshot from a different conversation is
+     * rejected for a few KB, instead of after reading 1.7 GB. */
+    int *hist = (int *)malloc((size_t)nh * sizeof(int));
+    if (!hist) { fclose(f); return 0; }
+    if (fread(hist, sizeof(int) * (size_t)nh, 1, f) != 1
+        || memcmp(hist, ids, sizeof(int) * (size_t)nh) != 0) {
+        free(hist); fclose(f); return 0;
+    }
+
+    /* PHASE 2: the arrays. Past this point a failure has already half-written the
+     * state, so it must be reset rather than used. */
+    int ok = 1;
+    for (int L = 0; ok && L < M->n_layers; L++) {
+        DsV4AttnState *st = &R->st[L];
+        int32_t sc[8];
+        const int32_t want[7] = { st->b, st->hd, st->win, st->ncomp,
+                                  st->ratio, st->coff, st->i_hd };
+        if (fread(sc, sizeof sc, 1, f) != 1 || memcmp(sc, want, sizeof want) != 0) {
+            ok = 0; break;
+        }
+        Blob b[SNAP_MAX_BLOBS];
+        const int nb = state_blobs(st, b);
+        for (int i = 0; ok && i < nb; i++)
+            if (b[i].n && fread(b[i].p, b[i].n, 1, f) != 1) ok = 0;
+        st->n_written = sc[7];
+    }
+    fclose(f);
+    if (!ok) {
+        fprintf(stderr, "[snap] %s is truncated or inconsistent; starting cold\n", path);
+        free(hist); run_reset(R); return 0;
+    }
+    memcpy(R->hist, hist, sizeof(int) * (size_t)nh);
+    R->nhist = nh;
+    R->pos = pos;
+    free(hist);
+    return nh;
+}
+
+/* ---------------------------------------------------------------------------
+ * CHECKPOINTS: several snapshots along the prompt, not just one at the end.
+ *
+ * A single snapshot is all-or-nothing. Our state cannot be rewound -- the
+ * compressors and the indexer accumulate an in-progress block that cannot be
+ * un-accumulated -- so a prompt that diverges from the cached one at token 15000
+ * cannot use a 20000-token snapshot AT ALL, and the whole prefill is paid again.
+ *
+ * With a checkpoint every DSV4_CKPT_EVERY tokens, the deepest one BEFORE the
+ * divergence is used and only the tail is prefilled. llama.cpp added
+ * --ctx-checkpoints for this, and for the same underlying reason: an SWA state
+ * cannot be rolled back either.
+ *
+ * One file per checkpoint, named by its token count, so the directory is scanned
+ * deepest-first and the arrays of a rejected candidate are never read.
+ * ------------------------------------------------------------------------- */
+#ifdef _WIN32
+#include <direct.h>
+#define ck_mkdir(p) _mkdir(p)
+#else
+#include <sys/stat.h>
+#define ck_mkdir(p) mkdir(p, 0755)
+#endif
+#include <dirent.h>
+
+static void ck_path(char *buf, size_t n, const char *dir, int ntok) {
+    snprintf(buf, n, "%s/ck_%08d.bin", dir, ntok);
+}
+
+/* The token counts present in `dir`, largest first. */
+static int ck_list(const char *dir, int *out, int max)
+{
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *e;
+    while (n < max && (e = readdir(d))) {
+        int ntok = 0;
+        if (sscanf(e->d_name, "ck_%d.bin", &ntok) != 1 || ntok <= 0) continue;
+        int i = n++;
+        while (i > 0 && out[i - 1] < ntok) { out[i] = out[i - 1]; i--; }
+        out[i] = ntok;
+    }
+    closedir(d);
+    return n;
+}
+
+/* The deepest checkpoint whose history is a prefix of this prompt. */
+static int snap_load_best(Run *R, const char *dir, const int *ids, int np)
+{
+    int toks[512];
+    const int n = ck_list(dir, toks, 512);
+    for (int i = 0; i < n; i++) {
+        if (toks[i] >= np) continue;       /* would leave no token to feed */
+        char path[1200];
+        ck_path(path, sizeof path, dir, toks[i]);
+        const int got = snap_load(R, path, ids, np);
+        if (got) return got;
+    }
+    return 0;
+}
+
+/* BOS, but only once -- and in ONE place.
+ *
+ * The gateway's chat template already emits <|begin_of_sentence|> itself, and it
+ * survives tokenization as id 0 because tok.h treats added_tokens as atomic.
+ * Prepending unconditionally produced [0, 0, ...], a double BOS the model never
+ * saw in training. So the text is tokenized first and BOS added only if missing;
+ * that stays correct whichever renderer the caller uses, and for a raw
+ * /v1/completions prompt too.
+ *
+ * Shared by serve mode and the offline cache builder: a single token of difference
+ * between them would make the snapshot's history fail to match, and the symptom
+ * would be a silent cache miss after hours of work. */
+static int encode_with_bos(Model *M, const char *text, int len, int *ids, int cap)
+{
+    int n = tok_encode(&M->tok, text, len, ids + 1, cap - 1);
+    if (n < 1) return 0;
+    if (ids[1] == M->bos) memmove(ids, ids + 1, (size_t)n * sizeof(int));
+    else { ids[0] = M->bos; n++; }
+    return n;
+}
+
 /* One token in, the logits out. */
 static const float *run_step(Run *R, int tokid) {
     Model *M = R->M;
@@ -1216,23 +1450,28 @@ static void serve_one(Run *R, ServeReq *q) {
     Model *M = R->M;
     const int cap = 65536;
     int *ids = malloc((size_t)cap * sizeof(int));
-    /* BOS, but only once.
-     *
-     * The gateway's chat template already emits <|begin_of_sentence|> itself, and
-     * it survives tokenization as id 0 because tok.h treats added_tokens as
-     * atomic. Prepending unconditionally produced [0, 0, ...] -- a double BOS,
-     * which the model never saw in training. So it is tokenized first and BOS is
-     * added only if it is not already there; that stays correct whichever
-     * renderer the caller uses, and for a raw /v1/completions prompt too. */
-    int np = tok_encode(&M->tok, q->payload, q->plen, ids + 1, cap - 1);
+    const int np = encode_with_bos(M, q->payload, q->plen, ids, cap);
     if (np < 1) {
         printf("ERROR %s EMPTY_PROMPT\n", q->id); fflush(stdout); free(ids); return;
     }
-    if (ids[1] == M->bos) {
-        memmove(ids, ids + 1, (size_t)np * sizeof(int));
-    } else {
-        ids[0] = M->bos;
-        np++;
+
+    /* CAPTURE THE PROMPT, once per process.
+     *
+     * The agent's opening prompt is what the cache has to be built for, and this
+     * is the only place where the exact bytes the tokenizer sees are available --
+     * dumping it from the gateway would risk a renderer difference, and a single
+     * token of difference makes the snapshot miss. */
+    const char *dumpf = getenv("DSV4_DUMP_PROMPT");
+    static int dumped = 0;
+    if (dumpf && !dumped) {
+        dumped = 1;
+        FILE *d = fopen(dumpf, "wb");
+        if (d) {
+            fwrite(q->payload, 1, (size_t)q->plen, d);
+            fclose(d);
+            fprintf(stderr, "[snap] prompt captured: %d bytes, %d tokens -> %s\n",
+                    q->plen, np, dumpf);
+        }
     }
 
     /* Refuse rather than corrupt. Past max_seq the compressed-KV index walks off
@@ -1263,6 +1502,17 @@ static void serve_one(Run *R, ServeReq *q) {
      * possible here: the KV ring could be, but the compressors and the indexer
      * accumulate an in-progress block that cannot be "un-accumulated". In that
      * case everything is rebuilt, which is correct and merely slower. */
+    /* PROMPT CACHE, tried only when there is nothing better in memory: the live
+     * state is always at least as good as a file, and reading 1.7 GB to replace it
+     * would be a pure loss. */
+    const char *snapd = getenv("DSV4_CACHE_DIR");
+    if (snapd && R->nhist == 0) {
+        const double t_l = now_s();
+        const int got = snap_load_best(R, snapd, ids, np);
+        if (got) fprintf(stderr, "[snap] restored %d of %d tokens in %.1f s\n",
+                         got, np, now_s() - t_l);
+    }
+
     int reuse = 0;
     while (reuse < R->nhist && reuse < np && R->hist[reuse] == ids[reuse]) reuse++;
     if (reuse < R->nhist || reuse >= np) { run_reset(R); reuse = 0; }
@@ -1308,6 +1558,22 @@ static void serve_one(Run *R, ServeReq *q) {
                 one_batch ? "batched attn" : "chunked", np - reuse, dt_pf,
                 dt_pf / (np - reuse));
         step = np - 1;                 /* the prompt is done; lo is its last logits */
+
+        /* Save straight after the prefill, not at the end of the request: this
+         * exists to protect hours of work, and a kill during generation must not
+         * throw it away. Only after an EXPENSIVE prefill, so the short tail of a
+         * follow-up turn does not rewrite 1.7 GB every turn. */
+        const char *smenv = getenv("DSV4_SNAP_MIN");
+        const int smin = smenv ? atoi(smenv) : 512;
+        if (snapd && np - reuse >= smin) {
+            char path[1200];
+            ck_mkdir(snapd);
+            ck_path(path, sizeof path, snapd, R->nhist);
+            const double t_s = now_s();
+            if (snap_save(R, path))
+                fprintf(stderr, "[snap] checkpoint at %d tokens saved in %.1f s\n",
+                        R->nhist, now_s() - t_s);
+        }
     }
 
     for (; ; step++) {
@@ -1428,6 +1694,91 @@ int main(int argc, char **argv) {
 
     /* The gateway launches the engine with SNAP=<dir>, SERVE=1 and
      * NGEN=<max_tokens>, and passes the cache `cap` as argv[1]. */
+    /* OFFLINE CACHE BUILD.
+     *
+     *   BUILD_CACHE=1 SNAP=<model dir> DSV4_PROMPT_FILE=<captured prompt>
+     *   DSV4_STATE_CACHE=<snapshot> deepseek_v4
+     *
+     * Prefill the prompt, write the snapshot, exit. No client, so nothing times out
+     * while hours of prefill run, and the result is a file the server picks up on
+     * its first request. That is the whole point: the cost is paid once, detached
+     * from any request. */
+    const char *bc = getenv("BUILD_CACHE");
+    if (bc && bc[0] == '1') {
+        const char *snapdir = getenv("SNAP");
+        const char *pf = getenv("DSV4_PROMPT_FILE");
+        const char *out = getenv("DSV4_CACHE_DIR");
+        if (!snapdir || !*snapdir || !pf || !out) {
+            fprintf(stderr, "BUILD_CACHE=1 needs SNAP=<dir>, DSV4_PROMPT_FILE and "
+                            "DSV4_CACHE_DIR\n");
+            return 1;
+        }
+        ck_mkdir(out);
+        FILE *pfh = fopen(pf, "rb");
+        if (!pfh) { fprintf(stderr, "cannot read %s\n", pf); return 1; }
+        fseek(pfh, 0, SEEK_END);
+        const long plen = ftell(pfh);
+        fseek(pfh, 0, SEEK_SET);
+        char *ptext = (char *)malloc((size_t)plen + 1);
+        if (!ptext || fread(ptext, 1, (size_t)plen, pfh) != (size_t)plen) {
+            fprintf(stderr, "cannot read %s\n", pf); return 1;
+        }
+        ptext[plen] = 0;
+        fclose(pfh);
+
+        Model M;
+        model_load(&M, snapdir);
+        char tp[1024];
+        snprintf(tp, sizeof tp, "%s/tokenizer.json", snapdir);
+        tok_load(&M.tok, tp);
+        Run R;
+        run_init(&R, &M);
+
+        const int cap = 65536;
+        int *ids = (int *)malloc((size_t)cap * sizeof(int));
+        const int np = encode_with_bos(&M, ptext, (int)plen, ids, cap);
+        if (np < 1) { fprintf(stderr, "empty prompt\n"); return 1; }
+        if (np > M.max_seq) {
+            fprintf(stderr, "prompt is %d tokens, DSV4_MAX_SEQ is %d\n", np, M.max_seq);
+            return 1;
+        }
+        /* ALL BUT THE LAST TOKEN, deliberately.
+         *
+         * A snapshot covering the whole prompt is unusable for that same prompt:
+         * generating needs the logits of the last position, and those only exist
+         * after feeding a token. snap_load therefore requires nh < np, the same
+         * condition the in-memory prefix reuse enforces. Stopping one token short
+         * leaves exactly that token for run_step, so replaying the captured prompt
+         * verbatim is a hit -- and a longer follow-up prompt is one too. */
+        if (np < 2) { fprintf(stderr, "prompt too short to cache\n"); return 1; }
+        const int nbuild = np - 1;
+
+        /* Prefill in slices, saving a checkpoint after each. run_prefill already
+         * takes an absolute start position and maintains the state itself, so a
+         * slice is the same work as the equivalent stretch of one long call --
+         * which is what makes checkpointing free here rather than a rewrite. */
+        const char *ckev = getenv("DSV4_CKPT_EVERY");
+        int every = ckev ? atoi(ckev) : 4096;
+        if (every < 64) every = 64;
+        fprintf(stderr, "[build] %ld bytes -> %d tokens; prefilling %d, checkpoint "
+                        "every %d\n", plen, np, nbuild, every);
+        const double t0 = now_s();
+        for (int done = 0; done < nbuild; ) {
+            const int take = (nbuild - done < every) ? nbuild - done : every;
+            run_prefill(&R, ids + done, take, done, 0);
+            done += take;
+            char path[1200];
+            ck_path(path, sizeof path, out, R.nhist);
+            if (!snap_save(&R, path)) return 1;
+            fprintf(stderr, "[build] checkpoint %d/%d tokens (%.1f s elapsed)\n",
+                    R.nhist, nbuild, now_s() - t0);
+        }
+        const double dt = now_s() - t0;
+        fprintf(stderr, "[build] done: %d tokens in %.1f s (%.3f s/token)\n",
+                nbuild, dt, dt / nbuild);
+        return 0;
+    }
+
     const char *sv = getenv("SERVE");
     if (sv && sv[0] == '1') {
 #ifdef _WIN32
