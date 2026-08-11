@@ -990,11 +990,23 @@ static void serve_one(Run *R, ServeReq *q) {
     Model *M = R->M;
     const int cap = 65536;
     int *ids = malloc((size_t)cap * sizeof(int));
-    int np = 0;
-    ids[np++] = M->bos;                              /* the model expects it */
-    np += tok_encode(&M->tok, q->payload, q->plen, ids + np, cap - np);
-    if (np <= 1) {
+    /* BOS, but only once.
+     *
+     * The gateway's chat template already emits <|begin_of_sentence|> itself, and
+     * it survives tokenization as id 0 because tok.h treats added_tokens as
+     * atomic. Prepending unconditionally produced [0, 0, ...] -- a double BOS,
+     * which the model never saw in training. So it is tokenized first and BOS is
+     * added only if it is not already there; that stays correct whichever
+     * renderer the caller uses, and for a raw /v1/completions prompt too. */
+    int np = tok_encode(&M->tok, q->payload, q->plen, ids + 1, cap - 1);
+    if (np < 1) {
         printf("ERROR %s EMPTY_PROMPT\n", q->id); fflush(stdout); free(ids); return;
+    }
+    if (ids[1] == M->bos) {
+        memmove(ids, ids + 1, (size_t)np * sizeof(int));
+    } else {
+        ids[0] = M->bos;
+        np++;
     }
 
     /* PREFIX REUSE (the protocol's "truncate-and-extend").
