@@ -917,6 +917,172 @@ static const float *run_step(Run *R, int tokid) {
     return R->logits;
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Chunked prefill.
+ *
+ * The prompt used to go through the decode path one token at a time, which is
+ * what made a long prompt unusable: a 5k-token system prompt is ~100 minutes of
+ * time-to-first-token. Two costs dominate and batching attacks both.
+ *
+ *   ATTENTION re-reads its 5.40 GB of resident weights FOR EVERY TOKEN, and at 18
+ *   GB/s that is 0.30 s each. As a batch it is 5.40 GB per CHUNK: the projections
+ *   become GEMMs whose arithmetic intensity rises with the chunk, so they stop
+ *   being memory-bound.
+ *
+ *   EXPERT I/O drops because a chunk shares experts. Measured on the real routing
+ *   trace, reads per token against the sequential LRU baseline of 124:
+ *   chunk 16 -> 96, chunk 64 -> 52, chunk 101 -> 42. dsv4_moe_forward already
+ *   walks the UNION of the chunk's experts, so this needs no new code -- only
+ *   rows > 1.
+ *
+ * The state is what makes it correct: dsv4_state_seed_from_prefill rebuilds what
+ * `n` sequential decode steps would have left, and check_real verifies that by
+ * decoding past the seam (bit-identical on all three layer kinds, and the test is
+ * known to fail when the seeding is broken).
+ *
+ * Returns the logits for the LAST position, which is the only one generation
+ * needs.
+ * ------------------------------------------------------------------------- */
+static const float *run_prefill(Run *R, const int *ids, int n)
+{
+    Model *M = R->M;
+    const int dim = M->dim, hc = M->hc;
+    const size_t stride = (size_t)hc * dim;
+
+    const int chunk = n;
+    float *h    = malloc((size_t)chunk * stride * sizeof(float));
+    float *mid  = malloc((size_t)chunk * stride * sizeof(float));
+    float *coll = malloc((size_t)chunk * dim * sizeof(float));
+    float *sub  = malloc((size_t)chunk * dim * sizeof(float));
+    float *post = malloc((size_t)chunk * hc * sizeof(float));
+    float *comb = malloc((size_t)chunk * hc * hc * sizeof(float));
+    float *tmp  = malloc((size_t)dim * sizeof(float));
+    int32_t *cid = malloc((size_t)chunk * sizeof(int32_t));
+
+    /* Capture buffers, sized for the widest chunk. Reused across layers and
+     * chunks: one allocation, not 43 per chunk. */
+    const int coff2 = 2;                       /* overlap layers need two halves */
+    const int hd = M->cfg[0].attn.hd;
+    int i_hd_max = 0, ratio_min = 0;
+    for (int L = 0; L < M->n_layers; L++) {
+        if (M->cfg[L].attn.i_hd > i_hd_max) i_hd_max = M->cfg[L].attn.i_hd;
+        if (M->cfg[L].attn.ratio && (!ratio_min || M->cfg[L].attn.ratio < ratio_min))
+            ratio_min = M->cfg[L].attn.ratio;
+    }
+    if (!ratio_min) ratio_min = 1;
+    DsV4Capture cap;
+    memset(&cap, 0, sizeof cap);
+    cap.kv      = malloc((size_t)chunk * hd * sizeof(float));
+    cap.ckv     = malloc((size_t)chunk * coff2 * hd * sizeof(float));
+    cap.csc     = malloc((size_t)chunk * coff2 * hd * sizeof(float));
+    cap.kv_comp = malloc((size_t)(chunk / ratio_min + 2) * hd * sizeof(float));
+    if (i_hd_max) {
+        cap.ikv       = malloc((size_t)chunk * coff2 * i_hd_max * sizeof(float));
+        cap.isc       = malloc((size_t)chunk * coff2 * i_hd_max * sizeof(float));
+        cap.i_kv_comp = malloc((size_t)(chunk / ratio_min + 2) * i_hd_max * sizeof(float));
+    }
+    int *tk = malloc((size_t)chunk * M->cfg[0].attn.win * sizeof(int));
+
+    /* ONE chunk, and that is a real limit, not a simplification.
+     *
+     * dsv4_attention_prefill derives each token's RoPE position as `r % s`, i.e.
+     * it assumes the batch starts at position 0. A second chunk would need the
+     * position offset, the window indices to reach back into the previous
+     * chunk's KV, and the already-compressed blocks to be attended -- that is
+     * prefill-with-existing-cache, and it is the next piece of work, not a
+     * detail. Until then the caller checks the length and falls back.
+     *
+     * The cap is memory: ~416 KB per token across h/mid, q/o and the working
+     * buffers, so 512 tokens is ~208 MB and 5k would be ~2 GB. */
+    {
+        const int base = 0;
+        const int cs = n;
+
+        /* embedding -> hc copies, for the whole chunk */
+        for (int t = 0; t < cs; t++) {
+            cid[t] = (int32_t)ids[base + t];
+            const DsV4W row = dsv4_w_rows(&M->embed, ids[base + t], 1);
+            const uint16_t *pw = (const uint16_t *)row.w;
+            for (int d = 0; d < dim; d++) R->emb[d] = dsv4_bf16_to_f32(pw[d]);
+            for (int m = 0; m < hc; m++)
+                memcpy(h + (size_t)t * stride + (size_t)m * dim, R->emb,
+                       (size_t)dim * sizeof(float));
+        }
+
+        for (int L = 0; L < M->n_layers; L++) {
+            DsV4BlockCfg *c = &M->cfg[L];
+            DsV4BlockW *w = &M->w[L];
+
+            /* --- attention, batched --------------------------------------- */
+            for (int t = 0; t < cs; t++) {
+                dsv4_hc_pre(h + (size_t)t * stride, w->hc_attn_fn, w->hc_attn_scale,
+                            w->hc_attn_base, hc, dim, c->sinkhorn_iters, c->hc_eps,
+                            c->norm_eps, coll + (size_t)t * dim,
+                            post + (size_t)t * hc, comb + (size_t)t * hc * hc);
+                dsv4_rmsnorm(tmp, coll + (size_t)t * dim, w->attn_norm, dim, c->norm_eps);
+                for (int d = 0; d < dim; d++)
+                    coll[(size_t)t * dim + d] = dsv4_to_bf16(tmp[d]);
+            }
+            { const double _t = now_s();
+              const int ntopk = dsv4_window_topk_prefill(tk, 1, cs, c->attn.win);
+              dsv4_attention_prefill_cap(&c->attn, &w->attn, coll, tk, 1, cs,
+                                         ntopk, sub, &cap);
+              /* Seed so the tokens after the prompt continue from exactly the
+               * state token-at-a-time decoding would have produced. */
+              dsv4_state_seed_from_prefill(&R->st[L], &c->attn, &w->attn, &cap, cs);
+              g_t_attn += now_s() - _t; }
+            for (int t = 0; t < cs; t++)
+                dsv4_hc_expand(mid + (size_t)t * stride, sub + (size_t)t * dim,
+                               post + (size_t)t * hc, comb + (size_t)t * hc * hc,
+                               h + (size_t)t * stride, hc, dim);
+
+            /* --- MoE, batched: one call, so the expert union applies ------- */
+            for (int t = 0; t < cs; t++) {
+                dsv4_hc_pre(mid + (size_t)t * stride, w->hc_ffn_fn, w->hc_ffn_scale,
+                            w->hc_ffn_base, hc, dim, c->sinkhorn_iters, c->hc_eps,
+                            c->norm_eps, coll + (size_t)t * dim,
+                            post + (size_t)t * hc, comb + (size_t)t * hc * hc);
+                dsv4_rmsnorm(tmp, coll + (size_t)t * dim, w->ffn_norm, dim, c->norm_eps);
+                for (int d = 0; d < dim; d++)
+                    coll[(size_t)t * dim + d] = dsv4_to_bf16(tmp[d]);
+            }
+            { const double _t = now_s();
+              dsv4_moe_forward(&c->moe, &w->moe, coll, cid, cs, sub);
+              g_t_moe += now_s() - _t; }
+            for (int t = 0; t < cs; t++)
+                dsv4_hc_expand(h + (size_t)t * stride, sub + (size_t)t * dim,
+                               post + (size_t)t * hc, comb + (size_t)t * hc * hc,
+                               mid + (size_t)t * stride, hc, dim);
+        }
+
+        /* The state now covers base+cs tokens; record them so prefix reuse and
+         * the next chunk agree with the decode path. */
+        for (int t = 0; t < cs; t++)
+            if (R->hist && R->nhist < R->hcap) R->hist[R->nhist++] = ids[base + t];
+        R->pos = base + cs;
+    }
+
+    /* logits for the last position only */
+    {
+        const int last = n - 1;
+        float y[8192], nz[8192];
+        dsv4_hc_head(h + (size_t)last * stride, M->hc_head_fn, M->hc_head_scale,
+                     M->hc_head_base, hc, dim, M->norm_eps, M->hc_eps, y);
+        dsv4_rmsnorm(nz, y, M->final_norm, dim, M->norm_eps);
+        for (int d = 0; d < dim; d++) nz[d] = dsv4_to_bf16(nz[d]);
+        const double _t = now_s();
+        dsv4_matmul_w(R->logits, nz, &M->head, 1, 0);
+        g_t_head += now_s() - _t;
+    }
+
+    free(h); free(mid); free(coll); free(sub); free(post); free(comb);
+    free(tmp); free(cid); free(tk);
+    free(cap.kv); free(cap.ckv); free(cap.csc); free(cap.kv_comp);
+    free(cap.ikv); free(cap.isc); free(cap.i_kv_comp);
+    return R->logits;
+}
+
 /* ---------------------------------------------------------------------------
  * Sampling. The CLI uses argmax; the gateway sends temperature and top_p per
  * request, so real nucleus sampling is needed.
@@ -1078,9 +1244,31 @@ static void serve_one(Run *R, ServeReq *q) {
     int gen = 0, limited = 1, cancelled = 0;
     int tokid = ids[reuse];
     double tdec = 0.0;
-    for (int step = reuse; ; step++) {
-        const float *lo = run_step(R, tokid);
-        if (step + 1 < np) { tokid = ids[step + 1]; continue; }   /* still prefill */
+
+    /* BATCHED PREFILL for the prompt, when it is allowed.
+     *
+     * Only from a fresh state (reuse == 0): dsv4_attention_prefill numbers
+     * positions from 0, so it cannot continue an existing KV. And only up to
+     * DSV4_PREFILL_MAX, because the batch costs ~416 KB per token.
+     *
+     * Outside those bounds the old token-at-a-time path still runs, so nothing
+     * regresses -- it is just slower. */
+    int step = reuse;
+    const float *lo = NULL;
+    const char *pfenv = getenv("DSV4_PREFILL_MAX");
+    const int pfmax = pfenv ? atoi(pfenv) : 512;
+    if (reuse == 0 && np > 1 && np <= pfmax) {
+        const double t_pf = now_s();
+        lo = run_prefill(R, ids, np);
+        const double dt_pf = now_s() - t_pf;
+        fprintf(stderr, "[serve] batched prefill: %d tokens in %.1f s (%.3f s/token)\n",
+                np, dt_pf, dt_pf / np);
+        step = np - 1;                 /* the prompt is done; lo is its last logits */
+    }
+
+    for (; ; step++) {
+        if (!lo) lo = run_step(R, tokid);
+        if (step + 1 < np) { tokid = ids[step + 1]; lo = NULL; continue; }  /* still prefill */
         if (gen == 0) tdec = now_s();
 
         const int nx = sample_tok(lo, M->vocab, q->temp, q->top_p);
@@ -1094,6 +1282,7 @@ static void serve_one(Run *R, ServeReq *q) {
         serve_data(q->id, piece, m);
         gen++;
         tokid = nx;
+        lo = NULL;                     /* next position needs its own forward */
 
         /* La pasarela puede cancelar mientras generamos. */
         while (coli_stdin_readable()) {
@@ -1113,6 +1302,8 @@ static void serve_one(Run *R, ServeReq *q) {
     const double decode = now_s() - (tdec > 0 ? tdec : t0);
     const uint64_t hits = M->tier.hits - hit0, miss = M->tier.miss - miss0;
     const uint64_t tot = hits + miss;
+    fprintf(stderr, "[prof] attn %.1f s | moe %.1f s (io %.1f) | head %.1f s | %.1f GB read\n",
+            g_t_attn, g_t_moe, g_t_io, g_t_head, (double)M->tier.bytes / 1e9);
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
            decode > 0 ? gen / decode : 0.0,
            tot ? 100.0 * (double)hits / (double)tot : 0.0,
