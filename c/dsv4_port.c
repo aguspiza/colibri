@@ -1717,6 +1717,13 @@ static void win_argv_utf8(int *argc, char ***argv) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    /* stderr too, and this one is not cosmetic. Redirected to a file, stderr is
+     * BLOCK buffered, so progress does not appear until 4 KB accumulate or the
+     * process exits: BUILD_CACHE ran 65 minutes with a 362-byte log, and the
+     * `[build] checkpoint ...` lines a watcher was waiting for were sitting in the
+     * buffer. For a mode whose whole purpose is to run for hours unattended, a log
+     * that only shows up at the end is a defect, not an inconvenience. */
+    setvbuf(stderr, NULL, _IONBF, 0);
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);   /* so our UTF-8 output renders, not mojibake */
     win_argv_utf8(&argc, &argv);   /* see the note above: argv arrives as ANSI */
