@@ -655,7 +655,18 @@ static void model_load(Model *M, const char *dir) {
      * caught it: check_real builds the table for the single layer under test with
      * that layer's own parameters, so it matched the reference while the engine's
      * shared shortcut did not. */
-    M->max_seq = 2048;
+    /* max_seq sizes the freqs tables AND the compressed-KV region of every
+     * layer's state (ncomp = max_seq / ratio). Running past it is not a graceful
+     * truncation: `start_pos / ratio` walks off the end of st->kv and the freqs
+     * lookup reads past the table. Both silently. A 5k-token system prompt --
+     * ordinary for an agent -- would have corrupted the heap.
+     *
+     * Kept adjustable because it costs memory: the ratio-4 layers allocate
+     * (win + max_seq/4) * hd floats each, so 32k of context is ~2.7 GB of state
+     * across 43 layers. The bound is enforced in serve_one and in the CLI. */
+    const char *msenv = getenv("DSV4_MAX_SEQ");
+    M->max_seq = msenv ? atoi(msenv) : 8192;
+    if (M->max_seq < 256) M->max_seq = 256;
     const size_t ftab = (size_t)M->max_seq * (rd / 2) * 2;
     M->freqs  = malloc(ftab * sizeof(float));   /* compressed layers */
     M->freqs_w = malloc(ftab * sizeof(float));  /* pure sliding window */
@@ -1032,6 +1043,15 @@ static void serve_one(Run *R, ServeReq *q) {
     } else {
         ids[0] = M->bos;
         np++;
+    }
+
+    /* Refuse rather than corrupt. Past max_seq the compressed-KV index walks off
+     * the end of st->kv and the freqs lookup reads past its table -- both
+     * silently, which is the worst possible failure for a long system prompt. */
+    if (np + q->max_tok > M->max_seq) {
+        fprintf(stderr, "[serve] prompt %d + %d tokens exceeds max_seq %d "
+                        "(raise DSV4_MAX_SEQ)\n", np, q->max_tok, M->max_seq);
+        printf("ERROR %s BAD_REQUEST\n", q->id); fflush(stdout); free(ids); return;
     }
 
     /* PREFIX REUSE (the protocol's "truncate-and-extend").
