@@ -1237,11 +1237,17 @@ static void serve_one(Run *R, ServeReq *q) {
 
     /* Refuse rather than corrupt. Past max_seq the compressed-KV index walks off
      * the end of st->kv and the freqs lookup reads past its table -- both
-     * silently, which is the worst possible failure for a long system prompt. */
+     * silently, which is the worst possible failure for a long system prompt.
+     *
+     * CONTEXT_EXCEEDED, not BAD_REQUEST: the gateway maps the former to a 400 that
+     * names the limit and the length, so a client that knows how to compact a
+     * conversation gets the chance to. BAD_REQUEST became an opaque 500
+     * ("engine failed to process the request") that a pi agent retried ten times. */
     if (np + q->max_tok > M->max_seq) {
         fprintf(stderr, "[serve] prompt %d + %d tokens exceeds max_seq %d "
                         "(raise DSV4_MAX_SEQ)\n", np, q->max_tok, M->max_seq);
-        printf("ERROR %s BAD_REQUEST\n", q->id); fflush(stdout); free(ids); return;
+        printf("ERROR %s CONTEXT_EXCEEDED %d %d\n", q->id, np + q->max_tok, M->max_seq);
+        fflush(stdout); free(ids); return;
     }
 
     /* PREFIX REUSE (the protocol's "truncate-and-extend").
