@@ -310,9 +310,69 @@ def _unclosed_tail(reply, tools):
     return inner if inner.strip() in declared else None
 
 
+_V4_ENCODING = None
+
+
+def _v4_encoding():
+    """The vendored DeepSeek encoder, imported on first use.
+
+    Kept out of the module imports so a colibri install that never runs a V4
+    model does not need the file present.
+    """
+    global _V4_ENCODING
+    if _V4_ENCODING is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import encoding_dsv4                                  # noqa: E402
+        _V4_ENCODING = encoding_dsv4
+    return _V4_ENCODING
+
+
+def parse_tool_calls_v4(reply):
+    """Return (content, tool_calls) for a DeepSeek V4 completion.
+
+    Only the DSML block is handed to the vendor parser, not the whole message:
+    `parse_message_from_completion_text` asserts on a trailing EOS and on the
+    thinking structure, and by this point the gateway has already stripped the
+    reasoning block and the engine has consumed the EOS. Parsing just the block
+    keeps the part that cannot be guessed -- the DSML grammar -- without fighting
+    a whole-message contract that no longer holds.
+
+    Malformed output yields the raw text and no calls. The vendor parser raises on
+    anything it does not recognize, and a half-written call must not become a
+    fabricated one.
+    """
+    encoder = _v4_encoding()
+    # The vendor parser wants the index positioned just PAST the opening tag name
+    # and before its '>', because its own start token is "\n\n<|DSML|tool_calls"
+    # (leading newlines in, closing bracket out) and it then expects to read
+    # exactly ">\n" before the first invoke. Handing it the '<' fails the format
+    # check and yields no calls at all.
+    opening = "<%s%s" % (encoder.dsml_token, encoder.tool_calls_block_name)
+    at = reply.find(opening)
+    if at < 0:
+        return reply, []
+    content = reply[:at].rstrip("\n")
+    try:
+        _index, _stop, calls = encoder.parse_tool_calls(at + len(opening), reply)
+    except (AssertionError, ValueError, IndexError):
+        return reply, []
+    out = encoder.tool_calls_to_openai_format(calls)
+    # DSML carries no call id -- results are matched back by position -- but the
+    # OpenAI shape needs one, and the gateway reads tc["id"] on the streaming
+    # path. Same id shape as the GLM parser so clients see one convention.
+    for call in out:
+        call.setdefault("id", "call_" + uuid.uuid4().hex[:24])
+    return content, out
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
-    rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
+    rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter.
+
+    V4 emits a different grammar (DSML) and is delegated to its own parser, so all
+    three existing call sites keep working without knowing which arch replied."""
+    if ARCH == "deepseek_v4":
+        return parse_tool_calls_v4(reply)
     param_order = _tool_param_order(tools)
     param_types = _tool_param_types(tools)
     calls, salvaged = [], []
@@ -662,47 +722,78 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
 
 def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                    tool_choice=None):
-    """DeepSeek V4's native multi-turn chat template.
+    """DeepSeek V4's chat format, via the vendor's own encoder.
 
-    The target engine receives this as a raw prompt. Prior assistant turns end
-    with the checkpoint's EOS marker; the final assistant marker selects the
-    thinking or direct-answer prefix for the new turn.
+    encoding_dsv4.py is DeepSeek's self-contained reference implementation, taken
+    verbatim from the model repo (MIT). It is used rather than reimplemented for
+    two reasons:
+
+      - The checkpoint ships NO chat_template.jinja, so the format is not
+        derivable from the weights directory. Guessing it from the V3 convention
+        would have been wrong: V4 calls tools with a DSML block
+        (`<|DSML|tool_calls>` / `<|DSML|invoke>`), not with the
+        `<|tool_calls_begin|>` tokens that V3 used and that still sit unused in
+        this vocabulary.
+      - It ships four input/output test vectors, so the encoding can be pinned
+        instead of assumed. `make check-encoding` runs them.
+
+    What this fixes beyond tool calling: the previous renderer emitted a bare
+    `<|Assistant|>` and nothing else. The format requires a thinking-block marker
+    right after it -- `</think>` in chat mode to close the block immediately, or
+    `<think>` to open one in thinking mode. Without either, the model is left in a
+    state it never saw in training, which showed up as refusals and echoed prompts
+    on trivial requests.
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for DeepSeek V4 yet.",
-                       "tools", "unsupported_parameter")
-    bos = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
-    user = "<\uff5cUser\uff5c>"
-    assistant = "<\uff5cAssistant\uff5c>"
-    eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
-    parts = [bos]
+    if tool_choice not in (None, "none", "auto", "required"):
+        raise APIError(400, "Only `none`, `auto` and `required` tool_choice are supported.",
+                       "tool_choice", "unsupported_value")
+
+    encoder = _v4_encoding()
+    out = []
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant"):
+        if role not in ("system", "developer", "user", "assistant", "tool"):
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
-        if role in ("system", "developer"):
-            parts.append(text)
-        elif role == "user":
-            parts.extend((user, text))
-        else:
+        entry = {"role": role, "content": text}
+        # The encoder reads reasoning and tool metadata off the message itself.
+        if role == "assistant":
             reasoning = message.get("reasoning_content")
-            if reasoning is not None and not isinstance(reasoning, str):
-                raise APIError(400, "`reasoning_content` must be a string.",
-                               f"messages.{index}.reasoning_content")
-            parts.append(assistant)
-            if reasoning:
-                parts.extend(("<think>", reasoning, "</think>"))
-            else:
-                parts.append("</think>")
-            parts.extend((text, eos))
-    parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
-    return "".join(parts)
+            if reasoning is not None:
+                if not isinstance(reasoning, str):
+                    raise APIError(400, "`reasoning_content` must be a string.",
+                                   f"messages.{index}.reasoning_content")
+                entry["reasoning_content"] = reasoning
+            if message.get("tool_calls"):
+                entry["tool_calls"] = message["tool_calls"]
+        elif role == "tool":
+            # OpenAI puts the call id on the tool message; the encoder matches
+            # results back to calls by that id when it merges them into the user
+            # turn, so it has to be carried through.
+            if message.get("tool_call_id") is not None:
+                entry["tool_call_id"] = message["tool_call_id"]
+        out.append(entry)
+
+    if tools and tool_choice != "none":
+        # Tools are declared on the first system/developer message; the encoder
+        # renders the "## Tools" schema block from there. If the caller sent no
+        # system message, one is created to hold them.
+        host = next((m for m in out if m["role"] in ("system", "developer")), None)
+        if host is None:
+            host = {"role": "system", "content": ""}
+            out.insert(0, host)
+        host["tools"] = tools
+
+    return encoder.encode_messages(
+        out,
+        thinking_mode="thinking" if enable_thinking else "chat",
+        reasoning_effort=reasoning_effort if enable_thinking else None,
+    )
 
 
 def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, tools=None,

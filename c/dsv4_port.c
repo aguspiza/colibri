@@ -538,7 +538,8 @@ typedef struct {
 
     DsV4W embed, head;
     const float *final_norm, *hc_head_fn, *hc_head_base, *hc_head_scale;
-    float *freqs;           /* [max_seq, rd/2, 2] */
+    float *freqs;           /* [max_seq, rd/2, 2] -- compressed layers */
+    float *freqs_w;         /* idem, pure sliding-window layers (no YaRN) */
     int max_seq;
 } Model;
 
@@ -634,10 +635,34 @@ static void model_load(Model *M, const char *dir) {
     fprintf(stderr, "config: %d layers, dim %d, %d heads x %d, %d experts top-%d\n",
             M->n_layers, M->dim, heads, hd, n_exp, topk);
 
-    /* --- freqs_cis with YaRN -------------------------------------------- */
-    M->max_seq = 2048;                 /* enough for test prompts */
-    M->freqs = malloc((size_t)M->max_seq * (rd / 2) * 2 * sizeof(float));
-    dsv4_precompute_freqs(M->freqs, rd, M->max_seq, orig, base, factor, bf, bs);
+    /* --- freqs_cis with YaRN: TWO tables, chosen per layer ---------------
+     *
+     * The reference builds freqs_cis inside each Attention, and the parameters
+     * depend on whether that layer compresses (model.py, Attention.__init__):
+     *
+     *   compress_ratio != 0 -> original_seq_len = 65536, base = 160000  (YaRN on)
+     *   compress_ratio == 0 -> original_seq_len = 0,     base =  10000  (YaRN OFF,
+     *                          "disable YaRN ... in pure sliding-window attention")
+     *
+     * and that same table serves the layer's window q/kv, its Compressor and its
+     * Indexer. Using one table for all 43 layers -- which this engine did -- is
+     * wrong twice over: the 38 compressed layers get theta 10000 instead of
+     * 160000, and the 5 window-only layers get YaRN applied when it should be
+     * off.
+     *
+     * Both errors GROW WITH POSITION, which is why short prompts looked fine and
+     * a 300-token one produced word salad. It also explains why the harness never
+     * caught it: check_real builds the table for the single layer under test with
+     * that layer's own parameters, so it matched the reference while the engine's
+     * shared shortcut did not. */
+    M->max_seq = 2048;
+    const size_t ftab = (size_t)M->max_seq * (rd / 2) * 2;
+    M->freqs  = malloc(ftab * sizeof(float));   /* compressed layers */
+    M->freqs_w = malloc(ftab * sizeof(float));  /* pure sliding window */
+    jval *ctheta = json_get(C, "compress_rope_theta");
+    const double cbase = ctheta ? ctheta->num : base;
+    dsv4_precompute_freqs(M->freqs,   rd, M->max_seq, orig, cbase, factor, bf, bs);
+    dsv4_precompute_freqs(M->freqs_w, rd, M->max_seq, 0,    base,  factor, bf, bs);
 
     /* --- globales -------------------------------------------------------- */
     M->embed = mat_of(&M->S, "embed", M->vocab, M->dim);
@@ -677,7 +702,7 @@ static void model_load(Model *M, const char *dir) {
         w->attn.q_norm    = vec_f32(&M->S, B("layers.%d.attn.q_norm.weight", L), q_lora);
         w->attn.kv_norm   = vec_f32(&M->S, B("layers.%d.attn.kv_norm.weight", L), hd);
         w->attn.attn_sink = vec_f32(&M->S, B("layers.%d.attn.attn_sink", L), heads);
-        w->attn.freqs = M->freqs;
+        w->attn.freqs = ratio ? M->freqs : M->freqs_w;
 
         if (ratio) {
             const int coff = (ratio == 4) ? 2 : 1;
@@ -1239,6 +1264,12 @@ int main(int argc, char **argv) {
               g_t_head += now_s() - _t; }
             int best = 0;
             for (int v = 1; v < M.vocab; v++) if (logits[v] > logits[best]) best = v;
+            /* Stop at end-of-turn, like the serve path does. Without this the CLI
+             * ran past it and printed the marker as literal text, then kept
+             * rambling: "Respuesta: Berlin.<|end_of_sentence|>: el arte
+             * renacentista". Easy to read as the model degenerating when it had
+             * actually finished. */
+            if (best == M.eos || best == 128805 /* <|EOT|> */) break;
             if (step < n + ngen - 1) ids[step + 1] = best;
             char piece[64];
             const int m = tok_decode(&M.tok, &best, 1, piece, sizeof piece - 1);
