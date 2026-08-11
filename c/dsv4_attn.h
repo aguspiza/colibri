@@ -95,10 +95,35 @@ typedef struct {
 /* x   : [b, s, dim]     the block's input (already normalized by attn_norm)
  * topk: [b, s, ntopk]   window indices (+ the indexer's, when present)
  * out : [b, s, dim]                                                          */
-static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
-                                          const DsV4AttnW *w,
-                                          const float *x, const int *topk,
-                                          int b, int s, int ntopk, float *out)
+/* ---------------------------------------------------------------------------
+ * Prefill capture.
+ *
+ * Batched prefill is only a replacement for N decode steps if it also leaves the
+ * same state behind -- the KV ring, the compressor's in-progress block, the
+ * indexer's own compressed KV. Prefill already computes every one of those
+ * internally and then frees them, so rather than recomputing (which is the whole
+ * cost being avoided) it hands them out through this struct.
+ *
+ * Any field may be NULL: the caller allocates only what it intends to use, and a
+ * layer with compress_ratio == 0 has no compressor buffers to give. Sizes are the
+ * caller's responsibility and are documented per field.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    float *kv;        /* [b*s, hd]         window KV, post-norm/RoPE/quant */
+    float *ckv;       /* [b*s, coff*hd]    compressor projections, pre-pool */
+    float *csc;       /* [b*s, coff*hd]    its gate scores */
+    float *kv_comp;   /* [b, ngrp, hd]     the compressed entries */
+    float *ikv;       /* [b*s, coff*i_hd]  indexer compressor projections */
+    float *isc;       /* [b*s, coff*i_hd]  its gate scores */
+    float *i_kv_comp; /* [b, ngrp, i_hd]   indexer compressed KV */
+    int ngrp;         /* blocks actually produced (written by prefill) */
+} DsV4Capture;
+
+static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
+                                             const DsV4AttnW *w,
+                                             const float *x, const int *topk,
+                                             int b, int s, int ntopk, float *out,
+                                             DsV4Capture *cap)
 {
     const int64_t bs = (int64_t)b * s;
     const int qdim = c->heads * c->hd;
@@ -163,6 +188,8 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
             memcpy(kv + r * c->hd, tmp + r * nrope, (size_t)nrope * sizeof(float));
         free(tmp);
     }
+    if (cap && cap->kv)
+        memcpy(cap->kv, kv, (size_t)bs * c->hd * sizeof(float));
 
     /* --- compressed KV and the indexer's indices ------------------------- */
     /* In compressed layers attention looks at TWO regions: the recent sliding
@@ -186,9 +213,18 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
         dsv4_matmul_w(ckv, x, &w->c_wkv, (int)bs, 0);
         dsv4_matmul_w(csc, x, &w->c_wgate, (int)bs, 0);
         kv_comp = malloc((size_t)b * ngrp * c->hd * sizeof(float));
+        if (cap) {
+            const size_t nproj = (size_t)bs * coff * c->hd;
+            if (cap->ckv) memcpy(cap->ckv, ckv, nproj * sizeof(float));
+            if (cap->csc) memcpy(cap->csc, csc, nproj * sizeof(float));
+            cap->ngrp = ngrp;
+        }
         dsv4_compress_forward(ckv, csc, w->c_ape, w->c_norm, w->freqs,
                               b, s, c->ratio, c->hd, c->rd, overlap, 0,
                               c->eps, kv_comp);
+        if (cap && cap->kv_comp)
+            memcpy(cap->kv_comp, kv_comp,
+                   (size_t)b * ngrp * c->hd * sizeof(float));
         free(ckv); free(csc);
 
         /* ONLY layers with ratio == 4 have an Indexer. The high-ratio ones —
@@ -215,9 +251,17 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
             dsv4_matmul_w(ikv, x, &w->i_wkv, (int)bs, 0);
             dsv4_matmul_w(isc, x, &w->i_wgate, (int)bs, 0);
             float *ikvc = malloc((size_t)b * ngrp * c->i_hd * sizeof(float));
+            if (cap) {
+                const size_t niproj = (size_t)bs * coff * c->i_hd;
+                if (cap->ikv) memcpy(cap->ikv, ikv, niproj * sizeof(float));
+                if (cap->isc) memcpy(cap->isc, isc, niproj * sizeof(float));
+            }
             dsv4_compress_forward(ikv, isc, w->i_ape, w->i_norm, w->freqs,
                                   b, s, c->ratio, c->i_hd, c->rd, overlap, 1,
                                   c->eps, ikvc);
+            if (cap && cap->i_kv_comp)
+                memcpy(cap->i_kv_comp, ikvc,
+                       (size_t)b * ngrp * c->i_hd * sizeof(float));
             free(ikv); free(isc);
 
             /* the indexer's q: wq_b -> RoPE -> Hadamard -> FP4 */
@@ -301,6 +345,15 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
     dsv4_matmul_w(out, mid, &w->wo_b, (int)bs, 1);
 
     free(qr); free(q); free(kv); free(o); free(mid);
+}
+
+/* The original entry point: prefill with nothing captured. */
+static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
+                                          const DsV4AttnW *w,
+                                          const float *x, const int *topk,
+                                          int b, int s, int ntopk, float *out)
+{
+    dsv4_attention_prefill_cap(c, w, x, topk, b, s, ntopk, out, NULL);
 }
 
 #endif /* DSV4_ATTN_H */

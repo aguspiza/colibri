@@ -372,4 +372,101 @@ static inline void dsv4_attention_decode(const DsV4AttnCfg *c,
     free(qr); free(q); free(kv); free(o); free(tk); free(mid);
 }
 
+/* ---------------------------------------------------------------------------
+ * Seed a decode state from a batched prefill.
+ *
+ * This is what makes chunked prefill usable: after it runs, generation must
+ * continue from exactly the state N sequential decode steps would have left. Four
+ * things have to be reconstructed, and only the first is obvious.
+ *
+ *   1. THE KV RING. Prefill wrote token t at index t; decode writes it at
+ *      t % win. Replaying the writes in order leaves each slot holding the newest
+ *      token that maps to it, which is what the ring means.
+ *
+ *   2. THE COMPRESSED ENTRIES. Prefill already produced them; they go straight
+ *      into the region above the window.
+ *
+ *   3. THE COMPRESSOR'S IN-PROGRESS BLOCK -- the fiddly one. A prompt is almost
+ *      never a multiple of `ratio`, so the trailing tokens sit in
+ *      kv_state/score_state waiting for the block to fill. With overlap
+ *      (ratio == 4) the ring holds TWO blocks: the low half is the last COMPLETE
+ *      block, because decode rotates it down when a block closes, and the high
+ *      half is the partial one. Getting the halves the wrong way round produces a
+ *      state that looks plausible and decodes wrong from the first token after
+ *      the prompt.
+ *
+ *      score_state carries `score + ape[r]`, ape indexed by the position WITHIN
+ *      the block -- not by absolute position. Slots with no token keep -inf so
+ *      they weigh exactly zero once the block closes.
+ *
+ *   4. The indexer's own compressor, same treatment at its own dimension.
+ *
+ * `n` is the number of tokens prefilled, i.e. the next decode call uses
+ * start_pos = n. Only batch 1 is handled, which is all the engine does.
+ * ------------------------------------------------------------------------- */
+static inline void dsv4_state_seed_from_prefill(DsV4AttnState *st,
+                                                const DsV4AttnCfg *c,
+                                                const DsV4AttnW *w,
+                                                const DsV4Capture *cap, int n)
+{
+    const int hd = c->hd, win = st->win, ratio = c->ratio;
+
+    /* 1. the window ring */
+    if (cap->kv)
+        for (int t = 0; t < n; t++)
+            memcpy(st->kv + (size_t)(t % win) * hd,
+                   cap->kv + (size_t)t * hd, (size_t)hd * sizeof(float));
+
+    st->n_written = n;
+    if (!ratio) return;
+
+    /* 2. the compressed entries */
+    if (cap->kv_comp && cap->ngrp > 0)
+        memcpy(st->kv + (size_t)win * hd, cap->kv_comp,
+               (size_t)cap->ngrp * hd * sizeof(float));
+    if (cap->i_kv_comp && st->i_kv && cap->ngrp > 0)
+        memcpy(st->i_kv, cap->i_kv_comp,
+               (size_t)cap->ngrp * c->i_hd * sizeof(float));
+
+    /* 3 + 4. the in-progress block(s) */
+    const int coff = st->coff;
+    const int rem  = n % ratio;              /* tokens of the open block */
+    const int nblk = n / ratio;              /* complete blocks behind it */
+
+    /* One pass serves both compressors; they differ only in width. */
+    for (int which = 0; which < 2; which++) {
+        const int wd = which ? c->i_hd : hd;
+        const float *pk = which ? cap->ikv : cap->ckv;
+        const float *ps = which ? cap->isc : cap->csc;
+        const float *ape = which ? w->i_ape : w->c_ape;
+        float *ks = which ? st->i_kv_state    : st->kv_state;
+        float *ss = which ? st->i_score_state : st->score_state;
+        if (!ks || !ss || !pk || !ps) continue;
+
+        const int chan = coff * wd;
+        const size_t nslot = (size_t)coff * ratio;
+        for (size_t i = 0; i < nslot * chan; i++) { ks[i] = 0.0f; ss[i] = -INFINITY; }
+
+        /* With overlap, the low half is the last COMPLETE block (decode rotated
+         * it down); without overlap there is no low half at all. */
+        if (coff == 2 && nblk > 0) {
+            const int base = (nblk - 1) * ratio;
+            for (int r = 0; r < ratio; r++)
+                for (int ch = 0; ch < chan; ch++) {
+                    const size_t src = (size_t)(base + r) * chan + ch;
+                    ks[(size_t)r * chan + ch] = pk[src];
+                    ss[(size_t)r * chan + ch] = ps[src] + ape[(size_t)r * chan + ch];
+                }
+        }
+        /* The open block: slots [ratio, ratio+rem) with overlap, [0, rem) without. */
+        const int hi = (coff == 2) ? ratio : 0;
+        for (int r = 0; r < rem; r++)
+            for (int ch = 0; ch < chan; ch++) {
+                const size_t src = (size_t)(nblk * ratio + r) * chan + ch;
+                ks[(size_t)(hi + r) * chan + ch] = pk[src];
+                ss[(size_t)(hi + r) * chan + ch] = ps[src] + ape[(size_t)r * chan + ch];
+            }
+    }
+}
+
 #endif /* DSV4_DECODE_H */
