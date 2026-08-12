@@ -1811,7 +1811,7 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
               if (batch_attn) {
                   const int ntopk = dsv4_window_topk_prefill(tk, 1, cs, c->attn.win);
                   dsv4_attention_prefill_cap(&c->attn, &w->attn, coll, tk, 1, cs,
-                                             ntopk, sub, &cap);
+                                             ntopk, 0, sub, &cap);
                   /* Seed so the tokens after the prompt continue from exactly the
                    * state token-at-a-time decoding would have produced. */
                   dsv4_state_seed_from_prefill(&R->st[L], &c->attn, &w->attn, &cap, cs);

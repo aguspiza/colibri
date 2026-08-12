@@ -775,7 +775,7 @@ int main(int argc, char **argv) {
                     int *tks = malloc((size_t)n * c.win * sizeof(int));
                     const int nt = dsv4_window_topk_prefill(tks, 1, n, c.win);
                     float *pre = malloc((size_t)n * c.dim * sizeof(float));
-                    dsv4_attention_prefill_cap(&c, &w, xs, tks, 1, n, nt, pre, &cap);
+                    dsv4_attention_prefill_cap(&c, &w, xs, tks, 1, n, nt, 0, pre, &cap);
 
                     DsV4AttnState sd;
                     dsv4_state_init_full(&sd, 1, c.hd, c.win, 4096, c.ratio, c.i_hd);

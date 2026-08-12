@@ -53,11 +53,16 @@ static inline void dsv4_matmul(float *y, const float *x, const float *w,
  *
  *   out : [b, s, min(s, win)]
  */
-static inline int dsv4_window_topk_prefill(int *out, int b, int s, int win) {
+static inline int dsv4_window_topk_prefill_at(int *out, int b, int s, int win,
+                                             int pos0) {
     const int ntopk = (s < win) ? s : win;
     for (int bi = 0; bi < b; bi++)
         for (int i = 0; i < s; i++) {
             int *row = out + ((size_t)bi * s + i) * ntopk;
+            /* With pos0 > 0 the window reaches before the batch. Those entries are
+             * marked -1 here, which is CORRECT ONLY once the caller has nothing there
+             * to attend -- i.e. it is still the position-0 case. Prepending the prior
+             * window is the piece that makes pos0 > 0 usable. */
             const int start = (i - win + 1 > 0) ? i - win + 1 : 0;
             for (int j = 0; j < ntopk; j++) {
                 const int t = start + j;
@@ -65,6 +70,10 @@ static inline int dsv4_window_topk_prefill(int *out, int b, int s, int win) {
             }
         }
     return ntopk;
+}
+
+static inline int dsv4_window_topk_prefill(int *out, int b, int s, int win) {
+    return dsv4_window_topk_prefill_at(out, b, s, win, 0);
 }
 
 typedef struct {
@@ -119,11 +128,24 @@ typedef struct {
     int ngrp;         /* blocks actually produced (written by prefill) */
 } DsV4Capture;
 
+/* `pos0` is the ABSOLUTE position of the first token of the batch.
+ *
+ * Everything here used to derive a token's position as `r % s`, i.e. it assumed the
+ * batch was the start of the sequence. That is what confines batched attention to the
+ * first chunk and forces every later chunk -- and every turn of a conversation, which
+ * always continues from a non-zero position -- onto the token-at-a-time path. Measured
+ * on the engine: that path leaves 66 % of the wall clock in a single thread.
+ *
+ * This makes the RoPE and the compressed-block limit absolute, which is necessary but
+ * NOT sufficient: with pos0 > 0 the window of the first `win - 1` tokens reaches back
+ * before the batch, and the blocks compressed earlier are not in this KV at all. Those
+ * need the prior state passed in, and until they are, pos0 > 0 is rejected rather than
+ * silently wrong -- see the `todo` line in check_real. */
 static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
                                              const DsV4AttnW *w,
                                              const float *x, const int *topk,
-                                             int b, int s, int ntopk, float *out,
-                                             DsV4Capture *cap)
+                                             int b, int s, int ntopk, int pos0,
+                                             float *out, DsV4Capture *cap)
 {
     const int64_t bs = (int64_t)b * s;
     const int qdim = c->heads * c->hd;
@@ -158,7 +180,7 @@ static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
     /* RoPE over the last rd channels of each head */
     for (int64_t r = 0; r < bs; r++)
         for (int h = 0; h < c->heads; h++) {
-            const int pos = (int)(r % s);
+            const int pos = pos0 + (int)(r % s);
             dsv4_rope(q + r * qdim + (size_t)h * c->hd + (c->hd - c->rd),
                       w->freqs + (size_t)pos * (c->rd / 2) * 2,
                       1, 1, 1, c->rd, 0);
@@ -172,7 +194,7 @@ static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
         for (int i = 0; i < c->hd; i++) kv[r * c->hd + i] = dsv4_to_bf16(tmp[i]);
     }
     for (int64_t r = 0; r < bs; r++) {
-        const int pos = (int)(r % s);
+        const int pos = pos0 + (int)(r % s);
         dsv4_rope(kv + r * c->hd + (c->hd - c->rd),
                   w->freqs + (size_t)pos * (c->rd / 2) * 2, 1, 1, 1, c->rd, 0);
     }
@@ -240,7 +262,7 @@ static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
             keep = ngrp;
             ctopk = malloc((size_t)bs * keep * sizeof(int));
             for (int64_t r = 0; r < bs; r++) {
-                const int limit = ((int)(r % s) + 1) / c->ratio;
+                const int limit = (pos0 + (int)(r % s) + 1) / c->ratio;
                 for (int k = 0; k < keep; k++)
                     ctopk[r * keep + k] = (k >= limit) ? -1 : k + s;
             }
@@ -270,7 +292,11 @@ static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
             dsv4_matmul_w(iq, qr, &w->i_wq_b, (int)bs, 1);
             for (int64_t r = 0; r < bs; r++)
                 for (int h = 0; h < c->i_heads; h++) {
-                    const int pos = (int)(r % s);
+                    /* The indexer's q needs the absolute position too. This was the
+                     * fourth site assuming the batch starts at 0, after the main q,
+                     * the kv, and the compressed-block limit -- found by reading, not
+                     * by the tests, because every existing test calls with pos0 = 0. */
+                    const int pos = pos0 + (int)(r % s);
                     dsv4_rope(iq + r * iqdim + (size_t)h * c->i_hd
                                  + (c->i_hd - c->rd),
                               w->freqs + (size_t)pos * (c->rd / 2) * 2,
@@ -321,10 +347,14 @@ static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
         if (kv_cat != kv) free(kv_cat);
     }
 
-    /* INVERSE RoPE on the output, before the projection */
+    /* INVERSE RoPE on the output, before the projection.
+     *
+     * The fifth and last site: it has to undo exactly the rotation applied to q, so
+     * if that one is absolute this one must be too. Getting one of the pair wrong
+     * would leave a residual rotation -- plausible output, subtly wrong. */
     for (int64_t r = 0; r < bs; r++)
         for (int h = 0; h < c->heads; h++) {
-            const int pos = (int)(r % s);
+            const int pos = pos0 + (int)(r % s);
             dsv4_rope(o + r * qdim + (size_t)h * c->hd + (c->hd - c->rd),
                       w->freqs + (size_t)pos * (c->rd / 2) * 2,
                       1, 1, 1, c->rd, 1);
@@ -353,7 +383,7 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
                                           const float *x, const int *topk,
                                           int b, int s, int ntopk, float *out)
 {
-    dsv4_attention_prefill_cap(c, w, x, topk, b, s, ntopk, out, NULL);
+    dsv4_attention_prefill_cap(c, w, x, topk, b, s, ntopk, 0, out, NULL);
 }
 
 #endif /* DSV4_ATTN_H */
