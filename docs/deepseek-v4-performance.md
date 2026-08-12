@@ -597,6 +597,96 @@ available.
 with the throughput difference inside the noise (254 MB/s against 325 and 230).
 Clean file pages cost nothing to move.
 
+## The expert cache: right for decode, useless for prefill, and measured wrong
+
+### What the LRU is actually for
+
+Two uses of layer L are 258 expert reads apart in DECODE (42 other layers x 6
+experts), which a 384-slot cache absorbs -- that is the original 124.2
+misses/token against 258 requests. In CHUNKED PREFILL they are ~10,700 apart,
+because a chunk visits every layer's whole union before coming back. No cache
+short of the entire model survives that gap.
+
+Measured, 512 real tokens, chunk 128, 384 slots:
+
+```
+[prog] 512/512  1.05 s/token  | lru 384/384 slots  0.0% hit  290 GB read
+```
+
+**0.0 %.** Not "flat", not "redundant with the page cache" as this document
+previously said -- zero. The cache must exist and must be correct, because decode
+depends on it, but in prefill it cannot be a reuse cache. It can only be a buffer
+pool.
+
+### Three measurement bugs, all mine
+
+**`argv[1]` was never read in BUILD_CACHE.** The parse sat inside the `SERVE`
+branch, so three relaunches with caches of "172, 301, 344 slots" all ran with the
+default 384. That is why private memory never moved between them, and why every
+LRU-size comparison from that night is void. `DSV4_CACHE` was the only knob that
+worked; the parse now happens before the mode branches.
+
+**The hit counter measured the prefetch, not the cache.** `hits` was incremented in
+`tier_prefetch` on every `tier_find` success. That was fine while prefetch ran once
+per layer, and became nonsense when the window became a sliding one and it ran once
+per expert in the union: it reported **98.1 %**, which is the rate at which the
+prefetch recognizes what it just queued. Accounting now counts `uses` (in
+`tier_get`, one per real request) against reads issued, both idempotent.
+
+**The prefetch inverted the eviction policy.** `tier_prefetch` also bumped
+`slots[f].used` on a find. With a sliding window, the experts furthest ahead get
+re-found on every call and look freshest, while the one about to be consumed --
+queued a while ago, not re-found since -- looks oldest. **The LRU was evicting
+precisely the next expert it needed.** Recency now belongs to real use only.
+
+### What linearity actually buys
+
+The router of layer L depends on layer L-1's output, so *which* experts a layer
+wants is not knowable ahead. Reading that as "nothing is knowable" was a mistake:
+the *structure* is fixed. Prefill walks layers 0..42 and the next chunk walks them
+again, and with 256 rows a layer's union is 173 of 256 experts (2.2 GB, measured
+from the read counters). The previous chunk's union predicts the next one well
+enough to fetch it while the current layer computes.
+
+Before this, the only prefetch was the current layer's union, taken from the
+router -- i.e. requested exactly when it was already needed. The chain
+`attention -> router -> read -> MoE` is serial per layer, which is why the engine
+sat at 37-54 % CPU with the disk at 183-360 MB/s of the 1514 MB/s it can deliver.
+
+### And then the layout made prediction unnecessary
+
+A layer's 256 experts are 1536 tensors sitting **contiguously in a single shard**:
+
+```
+capa  0: 256 expertos, 1536 tensores, shards [1]
+         rango 3.55 GB  |  bytes utiles 3.42 GB  |  huecos internos: 1
+```
+
+96 % dense, one gap. So:
+
+| strategy | bytes | rate | per layer |
+|---|---|---|---|
+| 173 scattered experts (68 %) | 2.2 GB | 216-360 MB/s | 6-10 s |
+| the whole range, sequential | 3.55 GB | 1514 MB/s (measured, one thread) | **2.3 s** |
+
+**Reading 61 % more bytes takes a third of the time**, because this drive gives ~7x
+more sequentially than scattered. Which removes the problem instead of optimizing
+it: there is nothing to predict and nothing to cache, because the whole layer comes
+every time. The router's choice stops mattering, the 32 % waste of a partial union
+disappears, and an expert index becomes an offset into a buffer.
+
+Two buffers of 3.55 GB -- compute L out of one while L+1 lands in the other -- which
+is 7.1 GB, and the reason two is the right depth rather than three: a third only
+helps if reads were more than twice as slow as compute, and then the disk is the
+wall and getting further ahead buys nothing.
+
+Implemented behind `DSV4_LAYER_STREAM=1`, with the per-expert path left intact for
+decode. **The 3-4x is arithmetic from two measured rates, not a measured result** --
+43 layers x 3.55 GB per 256-token chunk at 1514 MB/s would be 0.39 s/token against
+the 1.32-1.78 observed. Whether the drive holds that rate across 152 GB per chunk,
+and whether compute then becomes the wall, is the next thing to measure and not
+something to claim here.
+
 ## What is left
 
 - **I/O is 39 %** of the time (6.6 s of 16.8). The floor is the distinct experts

@@ -228,6 +228,36 @@ static uint8_t *smap_ptr(shards *S, const char *nm) {
 }
 
 /* ---------------------------------------------------------------------------
+ * DIRECT I/O for the expert reads.
+ *
+ * Buffered reads populate the SYSTEM FILE CACHE, and on a machine streaming 137 GB
+ * that cache grows without bound: measured at 12.49 GB of 31.4 GB while our own LRU
+ * held another 4.4 GB of the same kind of data. Two caches for the same bytes, and
+ * only one of them is ours. Worse, that 12.5 GB is what squeezed the engine's own
+ * anonymous memory out to the page file -- it grew ~20 GB over a night, filled the
+ * disk, and reads eventually failed with EIO. We evicted ourselves.
+ *
+ * With FILE_FLAG_NO_BUFFERING the reads bypass that cache entirely, so the RAM the
+ * engine occupies is the RAM we decided to give it: the LRU and nothing else.
+ *
+ * The price is alignment. Offset, length AND buffer must be multiples of the sector
+ * size, and our tensors sit at arbitrary offsets. So each slot buffer is allocated
+ * 4K-aligned with a page of slack, the read starts at the aligned offset BELOW the
+ * tensor, and `data` points at the tensor inside it. Nothing is copied.
+ *
+ * compat_open_direct's contract is what makes this safe to attempt: a misaligned
+ * request fails with -1, it never returns wrong bytes. A mistake here is loud.
+ * ------------------------------------------------------------------------- */
+#define DIO_ALIGN 4096
+#define dio_down(x) ((x) & ~(int64_t)(DIO_ALIGN - 1))
+#define dio_up(x)   (((x) + DIO_ALIGN - 1) & ~(int64_t)(DIO_ALIGN - 1))
+
+static int dio_on(void) {
+    const char *e = getenv("DSV4_DIRECT");
+    return e && e[0] == '1';
+}
+
+/* ---------------------------------------------------------------------------
  * The streaming expert tier.
  *
  * One expert is 3 MXFP4 matrices plus their scales = 13.4 MB. All 11,008 do not
@@ -236,14 +266,18 @@ static uint8_t *smap_ptr(shards *S, const char *nm) {
  * up by name, it is a `pread` to a known offset.
  * ------------------------------------------------------------------------- */
 typedef struct {
-    uint8_t *buf[6];        /* w1,w1s, w2,w2s, w3,w3s */
+    uint8_t *buf[6];        /* the ALLOCATION: 4K-aligned, with slack for direct I/O */
+    uint8_t *data[6];       /* the tensor itself: buf + (off - align_down(off)) */
     int layer, expert;
     uint64_t used;
     int pending;            /* reads in flight; 0 = ready to use */
 } ExpSlot;
 
 /* One read job: one tensor of one expert into one slot. */
-typedef struct { int slot, layer, expert, k; } RdJob;
+/* kind 0: one tensor of one expert into an LRU slot (decode).
+ * kind 1: one PIECE of a whole layer's contiguous range into a layer buffer, where
+ *         `slot` is the buffer and `k` the piece index. */
+typedef struct { int slot, layer, expert, k, kind; } RdJob;
 
 /* An expert tensor, already resolved: no name lookups on the hot path. */
 typedef struct { int shard; int64_t off, nb; } ExpTensor;
@@ -254,9 +288,68 @@ typedef struct {
     ExpTensor *tens;        /* [(layer*n_experts + e)*6 + k] */
     ExpSlot *slots;
     int nslot;
-    uint64_t clock, hits, miss;
+    /* `miss` counts expert READS ISSUED and is idempotent: once an expert is
+     * reserved, tier_find sees it, so a second prefetch call cannot count it again.
+     * `uses` counts how many times the MoE ASKS for an expert. Hit rate is derived
+     * from the two.
+     *
+     * There used to be a `hits` counter incremented in tier_prefetch on every
+     * tier_find success, which was fine while prefetch was called once per layer and
+     * became nonsense when the sliding window started calling it once per expert in
+     * the union: it reported 98.1 %, which is the rate at which the prefetch
+     * re-recognizes what it just queued, not the rate at which reads are avoided. */
+    uint64_t clock, uses, miss;
     uint64_t bytes;
     int mapped;             /* LOAD_ALL: no buffers, no LRU, read from the map */
+    int direct;             /* DSV4_DIRECT=1: unbuffered reads, our LRU is the cache */
+    /* TWO-LAYER DOUBLE BUFFER.
+     *
+     * The router of layer L depends on layer L-1's output, so WHICH experts a layer
+     * wants cannot be known in advance. The STRUCTURE can: prefill walks layers
+     * 0..42 and the next chunk walks them again, and with 256 rows a layer's union is
+     * huge -- measured 173 of 256 experts, 2.2 GB. So the previous chunk's union for
+     * layer L+1 predicts the next one well enough to read it while layer L computes.
+     * That is what the linearity buys: we cannot predict the router, and we do not
+     * need to.
+     *
+     * Two layers is the natural depth rather than an approximation: compute L while
+     * reading L+1. A third would only help if reads were more than twice as slow as
+     * compute, and then the disk is the wall and getting further ahead buys nothing.
+     * 2 x 173 experts is ~4.4 GB, which a 384-slot cache already holds.
+     *
+     * The LRU stays, and matters -- for DECODE. There, two uses of layer L are 258
+     * expert reads apart and the cache captures the reuse; in chunked prefill they are
+     * ~10,700 apart and it captures none (measured: 1.3 % hit). Same structure, two
+     * regimes, and only one of them is about reuse. */
+    /* WHOLE-LAYER STREAMING (DSV4_LAYER_STREAM=1).
+     *
+     * A layer's 256 experts are 1536 tensors that sit CONTIGUOUSLY in a single
+     * shard: 3.42 GB of data inside a 3.55 GB range, one internal gap, 96 % dense.
+     * That changes the arithmetic completely.
+     *
+     *   173 scattered experts (68 %)   2.2 GB at 216-360 MB/s  =  6-10 s
+     *   the whole range, sequential    3.55 GB at 1514 MB/s    =  2.3 s
+     *
+     * Reading 61 % MORE bytes takes a THIRD of the time, because this drive gives 7x
+     * more sequentially than scattered. So there is nothing to predict and nothing to
+     * cache: bring the whole layer, always. The router's choice stops mattering, the
+     * 32 % waste of a per-expert union disappears, and an expert index becomes an
+     * offset inside the buffer.
+     *
+     * Two buffers, 3.55 GB each: compute layer L out of one while L+1 lands in the
+     * other. */
+    int lstream;            /* the whole-layer path is active */
+    int lbuf_n;             /* 2 */
+    uint8_t *lbuf[2];
+    int lbuf_layer[2];      /* which layer each buffer holds, -1 = nothing */
+    int lbuf_pend[2];       /* pieces still in flight */
+    int64_t *lay_off, *lay_len;   /* [layer] the contiguous range */
+    int *lay_shard;
+    int64_t lspan;          /* the widest layer, i.e. the buffer size */
+    int lpieces;            /* how many parallel pieces per layer */
+
+    int *pred, *pred_n;     /* [layer][n_experts]: the previous chunk's union */
+    int *cur,  *cur_n;      /* [layer][n_experts]: the one being built now */
 
     /* UN DESCRIPTOR POR HILO Y SHARD.
      *
@@ -323,14 +416,129 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
 #else
     T->nthreads = 1;
 #endif
+    /* The contiguous range of every layer's experts, from the offsets already
+     * resolved above. Measured: 3.42 GB of tensors inside a 3.55 GB span, in one
+     * shard, with a single internal gap. */
+    T->lay_off   = (int64_t *)malloc((size_t)n_layers * sizeof(int64_t));
+    T->lay_len   = (int64_t *)malloc((size_t)n_layers * sizeof(int64_t));
+    T->lay_shard = (int *)malloc((size_t)n_layers * sizeof(int));
+    T->lspan = 0;
+    for (int L = 0; L < n_layers; L++) {
+        int64_t lo = INT64_MAX, hi = 0;
+        int sh = -1, multi = 0;
+        for (int e = 0; e < n_experts; e++)
+            for (int k = 0; k < 6; k++) {
+                const ExpTensor *d = &T->tens[((size_t)L * n_experts + e) * 6 + k];
+                if (sh < 0) sh = d->shard; else if (sh != d->shard) multi = 1;
+                if (d->off < lo) lo = d->off;
+                if (d->off + d->nb > hi) hi = d->off + d->nb;
+            }
+        T->lay_shard[L] = sh;
+        T->lay_off[L] = lo;
+        T->lay_len[L] = multi ? 0 : hi - lo;   /* 0 disables the fast path for it */
+        if (T->lay_len[L] > T->lspan) T->lspan = T->lay_len[L];
+    }
+
+    {   const char *e = getenv("DSV4_LAYER_STREAM");
+        T->lstream = (e && e[0] == '1' && T->lspan > 0);
+        T->lbuf_n = 2;
+        T->lpieces = T->nthreads > 0 ? T->nthreads : 8;
+        if (T->lstream) {
+            for (int b = 0; b < T->lbuf_n; b++) {
+                T->lbuf[b] = (uint8_t *)malloc((size_t)T->lspan);
+                T->lbuf_layer[b] = -1;
+                if (!T->lbuf[b]) {
+                    fprintf(stderr, "[lstream] cannot allocate 2 x %.2f GB; falling "
+                                    "back to per-expert reads\n", T->lspan / 1e9);
+                    T->lstream = 0;
+                }
+            }
+            if (T->lstream)
+                fprintf(stderr, "[lstream] whole-layer reads: 2 buffers of %.2f GB, "
+                                "%d pieces each\n", T->lspan / 1e9, T->lpieces);
+        }
+    }
+
+    T->pred   = (int *)calloc((size_t)n_layers * n_experts, sizeof(int));
+    T->cur    = (int *)calloc((size_t)n_layers * n_experts, sizeof(int));
+    T->pred_n = (int *)calloc((size_t)n_layers, sizeof(int));
+    T->cur_n  = (int *)calloc((size_t)n_layers, sizeof(int));
+
     T->nshard = S->nfd;
+    T->direct = dio_on();
     T->fd = malloc((size_t)T->nthreads * T->nshard * sizeof(int));
     for (int t = 0; t < T->nthreads; t++)
-        for (int i = 0; i < T->nshard; i++)
-            T->fd[t * T->nshard + i] =
-                (t == 0) ? S->fds[i] : open(S->paths[i], COMPAT_O_RDONLY);
+        for (int i = 0; i < T->nshard; i++) {
+            int fd = -1;
+            if (T->direct) {
+                fd = compat_open_direct(S->paths[i]);
+                if (fd < 0 && t == 0 && i == 0) {
+                    fprintf(stderr, "[dio] cannot open unbuffered; falling back to the "
+                                    "file cache\n");
+                    T->direct = 0;
+                }
+            }
+            /* Thread 0 reuses the shard's own descriptor in the buffered case; a
+             * direct descriptor is never shared with the rest of the loader, which
+             * still reads dense weights through the cache. */
+            if (fd < 0) fd = (t == 0) ? S->fds[i] : open(S->paths[i], COMPAT_O_RDONLY);
+            T->fd[t * T->nshard + i] = fd;
+        }
+    if (T->direct)
+        fprintf(stderr, "[dio] expert reads bypass the system file cache\n");
 
     tier_pool_start(T);
+}
+
+/* Queue the whole range of `layer` into a buffer, and return without waiting. */
+static void layer_start(ExpertTier *T, int layer)
+{
+    if (!T->lstream || layer < 0 || layer >= T->n_layers) return;
+    for (int b = 0; b < T->lbuf_n; b++)
+        if (T->lbuf_layer[b] == layer) return;          /* already here or coming */
+    /* Take the buffer that is not holding the layer being computed. */
+    int b = -1;
+    for (int i = 0; i < T->lbuf_n; i++)
+        if (T->lbuf_pend[i] == 0 && T->lbuf_layer[i] != layer - 1) { b = i; break; }
+    if (b < 0) return;                                   /* both busy: skip a beat */
+    T->lbuf_layer[b] = layer;
+    pthread_mutex_lock(&T->mu);
+    T->lbuf_pend[b] = T->lpieces;
+    for (int k = 0; k < T->lpieces; k++) {
+        RdJob j = { b, layer, 0, k, 1 };
+        T->q[T->qtail] = j;
+        T->qtail = (T->qtail + 1) % T->qcap;
+    }
+    pthread_cond_broadcast(&T->cv_job);
+    pthread_mutex_unlock(&T->mu);
+}
+
+/* The buffer holding `layer`, once its reads are done; -1 if it is not queued. */
+static int layer_wait(ExpertTier *T, int layer)
+{
+    for (int b = 0; b < T->lbuf_n; b++)
+        if (T->lbuf_layer[b] == layer) {
+            pthread_mutex_lock(&T->mu);
+            while (T->lbuf_pend[b]) pthread_cond_wait(&T->cv_done, &T->mu);
+            pthread_mutex_unlock(&T->mu);
+            return b;
+        }
+    return -1;
+}
+
+/* A chunk is starting: what this chunk used becomes the next one's prediction. */
+static void tier_chunk_begin(ExpertTier *T)
+{
+    if (!T->pred) return;
+    for (int L = 0; L < T->n_layers; L++) {
+        if (T->cur_n[L] > 0) {
+            memcpy(T->pred + (size_t)L * T->n_experts,
+                   T->cur  + (size_t)L * T->n_experts,
+                   (size_t)T->cur_n[L] * sizeof(int));
+            T->pred_n[L] = T->cur_n[L];
+        }
+        T->cur_n[L] = 0;
+    }
 }
 
 /* Look the expert up in the cache; -1 if it is not there. */
@@ -374,7 +582,20 @@ static void tier_alloc(ExpertTier *T, int slot, int layer, int e)
     ExpSlot *s = &T->slots[slot];
     const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6];
     for (int k = 0; k < 6; k++) {
-        if (!s->buf[k]) s->buf[k] = malloc((size_t)d[k].nb);
+        if (!s->buf[k]) {
+            /* One page of slack covers the worst-case distance from the tensor's
+             * offset down to the aligned one, plus the tail rounded up. */
+            const size_t cap = (size_t)dio_up(d[k].nb) + 2 * DIO_ALIGN;
+            void *m = NULL;
+            if (posix_memalign(&m, DIO_ALIGN, cap) != 0 || !m) {
+                fprintf(stderr, "out of memory for an expert slot (%zu bytes)\n", cap);
+                exit(1);
+            }
+            s->buf[k] = (uint8_t *)m;
+        }
+        /* The slack depends on THIS expert's offset, so it is recomputed on every
+         * (re)use of the slot, not once at allocation. */
+        s->data[k] = s->buf[k] + (T->direct ? (size_t)(d[k].off - dio_down(d[k].off)) : 0);
         T->bytes += (uint64_t)d[k].nb;
     }
     s->layer = layer; s->expert = e;
@@ -389,12 +610,48 @@ static void tier_read_one(ExpertTier *T, int slot, int layer, int e, int k, int 
     const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6 + k];
     const int fd = T->fd[(size_t)tid * T->nshard + d->shard];
     uint8_t *out = T->slots[slot].buf[k];
+    /* Buffered: read the tensor where it is. Direct: start at the aligned offset
+     * below it and read a whole number of blocks; `data` already points past the
+     * slack. `need` is what has to arrive; `span` is what may be asked for, and the
+     * two differ at the end of a shard, where the last block is short. */
+    const int64_t lo   = T->direct ? dio_down(d->off) : d->off;
+    const int64_t need = d->off + d->nb - lo;
+    const int64_t span = T->direct ? dio_up(need) : need;
     int64_t done = 0;
-    while (done < d->nb) {
-        const ssize_t got = pread(fd, out + done, (size_t)(d->nb - done), d->off + done);
-        if (got <= 0) { fprintf(stderr, "short pread at layer %d expert %d\n", layer, e); exit(1); }
+    while (done < need) {
+        const ssize_t got = pread(fd, out + done, (size_t)(span - done), lo + done);
+        if (got <= 0) {
+            fprintf(stderr, "short %s at layer %d expert %d tensor %d "
+                            "(off %lld len %lld)\n", T->direct ? "direct read" : "pread",
+                    layer, e, k, (long long)(lo + done), (long long)(span - done));
+            exit(1);
+        }
         done += got;
     }
+}
+
+/* One piece of a layer's range. Big sequential reads are the entire point, so the
+ * range is split only as far as there are workers. */
+static void tier_read_piece(ExpertTier *T, int buf, int layer, int piece, int tid)
+{
+    const int64_t len = T->lay_len[layer];
+    const int64_t per = (len + T->lpieces - 1) / T->lpieces;
+    const int64_t a = per * piece;
+    if (a >= len) return;
+    const int64_t nb = (len - a < per) ? len - a : per;
+    const int fd = T->fd[(size_t)tid * T->nshard + T->lay_shard[layer]];
+    uint8_t *out = T->lbuf[buf] + a;
+    int64_t done = 0;
+    while (done < nb) {
+        const ssize_t got = pread(fd, out + done, (size_t)(nb - done),
+                                  T->lay_off[layer] + a + done);
+        if (got <= 0) {
+            fprintf(stderr, "short read on layer %d piece %d\n", layer, piece);
+            exit(1);
+        }
+        done += got;
+    }
+    T->bytes += (uint64_t)nb;
 }
 
 /* A worker: pulls jobs off the queue until told to stop. Its index is also the
@@ -415,10 +672,12 @@ static void *tier_worker(void *arg)
         T->qhead = (T->qhead + 1) % T->qcap;
         pthread_mutex_unlock(&T->mu);
 
-        tier_read_one(T, j.slot, j.layer, j.expert, j.k, tid);
+        if (j.kind == 1) tier_read_piece(T, j.slot, j.layer, j.k, tid);
+        else             tier_read_one(T, j.slot, j.layer, j.expert, j.k, tid);
 
         pthread_mutex_lock(&T->mu);
-        if (--T->slots[j.slot].pending == 0) pthread_cond_broadcast(&T->cv_done);
+        if (j.kind == 1) { if (--T->lbuf_pend[j.slot] == 0) pthread_cond_broadcast(&T->cv_done); }
+        else if (--T->slots[j.slot].pending == 0) pthread_cond_broadcast(&T->cv_done);
         pthread_mutex_unlock(&T->mu);
     }
     return NULL;
@@ -520,6 +779,7 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
 #endif
         return;
     }
+    if (T->lstream) return;        /* whole layers are streamed; nothing per-expert to do */
     if (g_trace) for (int k = 0; k < n; k++)
         fprintf(g_trace, "%d %d %d\n", g_tok_no, layer, es[k]);
     for (int k = 0; k < n; k++) {
@@ -527,7 +787,15 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
         for (int j = 0; j < nw; j++) if (want[j] == es[k]) { dup = 1; break; }
         if (dup) continue;
         const int f = tier_find(T, layer, es[k]);
-        if (f >= 0) { T->hits++; T->slots[f].used = ++T->clock; continue; }
+        /* Found: nothing to do. Deliberately WITHOUT touching `used`.
+         *
+         * Recency belongs to real use (tier_get), not to "the prefetch looked at
+         * you". Bumping it here inverted the policy once the prefetch window became
+         * a sliding one: every call re-finds the experts furthest ahead and marks
+         * them as the most recent, while the expert about to be consumed -- queued a
+         * while ago and not re-found since -- looks like the oldest and gets evicted
+         * first. The LRU was throwing away precisely the next thing it needed. */
+        if (f >= 0) continue;
         T->miss++;
         /* How many DISTINCT experts the whole run asks for: that is the miss
          * count an infinite cache would have, i.e. the ceiling on what growing
@@ -554,6 +822,19 @@ static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
     pthread_mutex_unlock(&T->mu);
 }
 
+static void tier_prefetch_pred(ExpertTier *T, int layer)
+{
+    if (!T->pred || layer < 0 || layer >= T->n_layers) return;
+    const int n = T->pred_n[layer];
+    if (n <= 0) return;
+    /* Half the cache per layer, so the two layers in flight cannot starve
+     * tier_reserve of evictable slots. */
+    int lim = T->cap / 2;
+    if (lim < 1) lim = 1;
+    tier_prefetch(T, layer, T->pred + (size_t)layer * T->n_experts,
+                  n < lim ? n : lim);
+}
+
 /* Returns the expert's descriptors. After `tier_prefetch` this always hits; the
  * loading path stays as a safety net for callers that do not prefetch. */
 static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4W *w3)
@@ -574,6 +855,30 @@ static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4
         return;
     }
 
+    T->uses++;
+    if (T->lstream) {
+        /* Straight out of the layer's buffer: no lookup, no cache, no waiting -- the
+         * range was read while the previous layer computed. */
+        int b = layer_wait(T, layer);
+        if (b < 0) { layer_start(T, layer); b = layer_wait(T, layer); }
+        if (b >= 0) {
+            const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6];
+            uint8_t *q[6];
+            for (int k = 0; k < 6; k++)
+                q[k] = T->lbuf[b] + (d[k].off - T->lay_off[layer]);
+            *w1 = dsv4_w_mxfp4(q[0], q[1], T->inter, T->dim);
+            *w2 = dsv4_w_mxfp4(q[2], q[3], T->dim,   T->inter);
+            *w3 = dsv4_w_mxfp4(q[4], q[5], T->inter, T->dim);
+            return;
+        }
+    }
+    /* Record what this layer really used, which is the next chunk's prediction. */
+    if (T->cur && T->cur_n[layer] < T->n_experts) {
+        const int *row = T->cur + (size_t)layer * T->n_experts;
+        int seen = 0;
+        for (int i = 0; i < T->cur_n[layer]; i++) if (row[i] == e) { seen = 1; break; }
+        if (!seen) T->cur[(size_t)layer * T->n_experts + T->cur_n[layer]++] = e;
+    }
     int hit = tier_find(T, layer, e);
     if (hit < 0) {
         T->miss++;
@@ -589,9 +894,9 @@ static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4
 
     ExpSlot *s = &T->slots[hit];
     s->used = ++T->clock;
-    *w1 = dsv4_w_mxfp4(s->buf[0], s->buf[1], T->inter, T->dim);
-    *w2 = dsv4_w_mxfp4(s->buf[2], s->buf[3], T->dim,   T->inter);
-    *w3 = dsv4_w_mxfp4(s->buf[4], s->buf[5], T->inter, T->dim);
+    *w1 = dsv4_w_mxfp4(s->data[0], s->data[1], T->inter, T->dim);
+    *w2 = dsv4_w_mxfp4(s->data[2], s->data[3], T->dim,   T->inter);
+    *w3 = dsv4_w_mxfp4(s->data[4], s->data[5], T->inter, T->dim);
 }
 
 /* Adapter: the MoE asks for experts by callback and knows nothing about shards. */
@@ -1374,6 +1679,12 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
     for (int base = 0; base < n; base += step_n) {
         const int cs = (base + step_n <= n) ? step_n : n - base;
 
+        /* This chunk's uses become the next chunk's prediction. */
+        tier_chunk_begin(&M->tier);
+        /* Layer 0 has nobody ahead of it to have queued its experts. */
+        if (M->tier.lstream) layer_start(&M->tier, 0);
+        else                 tier_prefetch_pred(&M->tier, 0);
+
         /* embedding -> hc copies, for the whole chunk */
         for (int t = 0; t < cs; t++) {
             cid[t] = (int32_t)ids[base + t];
@@ -1388,6 +1699,17 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
         for (int L = 0; L < M->n_layers; L++) {
             DsV4BlockCfg *c = &M->cfg[L];
             DsV4BlockW *w = &M->w[L];
+
+            /* Queue the NEXT layer's predicted experts before doing any of this
+             * layer's work, so those reads run under this layer's attention and MoE
+             * instead of being waited for. Layer L's own experts were queued here one
+             * iteration ago; the MoE's own prefetch call, with the router's real
+             * union, is left as the correction pass for whatever the prediction
+             * missed. */
+            /* Whole-layer streaming reads L+1's entire contiguous range while
+             * this layer computes; the per-expert prediction is the fallback. */
+            if (M->tier.lstream) layer_start(&M->tier, L + 1);
+            else                 tier_prefetch_pred(&M->tier, L + 1);
 
             /* --- attention, batched --------------------------------------- */
             for (int t = 0; t < cs; t++) {
@@ -1458,12 +1780,21 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
             const int done = pos0 + base + cs;
             const double el = now_s() - g_prog_t0;
             const double per = (done > g_prog_from) ? el / (done - g_prog_from) : 0.0;
+            /* The LRU's own numbers go here too. Claiming a cache is "172 slots
+             * against 301" and comparing throughput is worthless if the slots are
+             * not actually filling, and private memory did not move between those
+             * two settings -- which is exactly the kind of thing that has to be
+             * read off the cache, not inferred from the process's memory. */
+            const ExpertTier *T = &R->M->tier;
             fprintf(stderr, "[prog] %d/%d  %.1f%%  %.2f s/token  %.0f min elapsed  "
-                            "eta %.1f h\n",
+                            "eta %.1f h  | lru %d/%d slots  %.1f%% hit  %.0f GB read\n",
                     done, g_prog_total,
                     g_prog_total ? 100.0 * done / g_prog_total : 0.0,
                     per, el / 60.0,
-                    (g_prog_total > done) ? (g_prog_total - done) * per / 3600.0 : 0.0);
+                    (g_prog_total > done) ? (g_prog_total - done) * per / 3600.0 : 0.0,
+                    T->nslot, T->cap,
+                    T->uses ? 100.0 * (1.0 - (double)T->miss / (double)T->uses) : 0.0,
+                    (double)T->bytes / 1e9);
         }
     }
 
@@ -1668,7 +1999,7 @@ static void serve_one(Run *R, ServeReq *q) {
     if (reuse < R->nhist || reuse >= np) { run_reset(R); reuse = 0; }
     if (reuse) fprintf(stderr, "[serve] prefix reused: %d of %d tokens\n", reuse, np);
 
-    const uint64_t hit0 = M->tier.hits, miss0 = M->tier.miss;
+    const uint64_t hit0 = M->tier.uses, miss0 = M->tier.miss;
     const double t0 = now_s();
 
     int gen = 0, limited = 1, cancelled = 0;
@@ -1760,8 +2091,9 @@ static void serve_one(Run *R, ServeReq *q) {
     }
 
     const double decode = now_s() - (tdec > 0 ? tdec : t0);
-    const uint64_t hits = M->tier.hits - hit0, miss = M->tier.miss - miss0;
-    const uint64_t tot = hits + miss;
+    const uint64_t uses = M->tier.uses - hit0, miss = M->tier.miss - miss0;
+    const uint64_t hits = uses > miss ? uses - miss : 0;
+    const uint64_t tot = uses;
     fprintf(stderr, "[prof] attn %.1f s | moe %.1f s (io %.1f) | head %.1f s | %.1f GB read\n",
             g_t_attn, g_t_moe, g_t_io, g_t_head, (double)M->tier.bytes / 1e9);
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
@@ -1847,6 +2179,14 @@ int main(int argc, char **argv) {
      * in an engine that pulls its tokens off the disk, a team spinning idle steals
      * cores from the I/O doing the real work. This engine is in that regime (I/O
      * is 40 % of the time). */
+    /* The cache size, BEFORE the mode branches.
+     *
+     * This lived inside the SERVE branch, so BUILD_CACHE ignored argv[1] entirely: a
+     * night of "LRU 172 against 301" comparisons all ran with the default 384, which
+     * is why private memory never moved between them and why the comparisons were
+     * meaningless. DSV4_CACHE (total slots) was the only knob that worked. */
+    if (argc > 1 && atoi(argv[1]) > 0) g_cache_per_layer = atoi(argv[1]);
+
     coli_omp_tune_threads("deepseek_v4");
     ws_cap();                      /* before anything is mapped or read */
 
@@ -1957,8 +2297,6 @@ int main(int argc, char **argv) {
 #endif
         const char *snap = getenv("SNAP");
         if (!snap || !*snap) { fprintf(stderr, "SERVE=1 needs SNAP=<dir>\n"); return 1; }
-        /* MinGW has no setenv, so the cap travels through a global instead. */
-        if (argc > 1 && atoi(argv[1]) > 0) g_cache_per_layer = atoi(argv[1]);
         Model M;
         model_load(&M, snap);
         char tp[1024];
@@ -2062,9 +2400,9 @@ int main(int argc, char **argv) {
            (double)(M.tier.bytes - g_fb_bytes) / 1e9, (double)g_fb_bytes / 1e9);
     printf("  of the MoE, %.1f s is expert I/O and %.1f s is compute\n",
            g_t_io, g_t_moe - g_t_io);
-    printf("experts: %llu hits / %llu miss (%.0f%% hit rate), %.2f GB read\n",
-           (unsigned long long)M.tier.hits, (unsigned long long)M.tier.miss,
-           100.0 * M.tier.hits / (double)(M.tier.hits + M.tier.miss),
+    printf("experts: %llu uses / %llu reads (%.0f%% avoided), %.2f GB read\n",
+           (unsigned long long)M.tier.uses, (unsigned long long)M.tier.miss,
+           M.tier.uses ? 100.0 * (1.0 - M.tier.miss / (double)M.tier.uses) : 0.0,
            (double)M.tier.bytes / 1e9);
     printf("  cache of %d slots (%.1f GB); %llu distinct experts in total\n"
            "  -> an infinite cache would miss %llu times instead of %llu\n",
