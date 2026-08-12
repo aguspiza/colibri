@@ -1895,7 +1895,16 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
                     el > 0 ? 100.0 * ((cu - g_cpu_u0) + (ck - g_cpu_k0)) / (el * ncore) : 0.0,
                     el > 0 ? 100.0 * (cu - g_cpu_u0) / (el * ncore) : 0.0,
                     el > 0 ? 100.0 * (ck - g_cpu_k0) / (el * ncore) : 0.0,
-                    el > 0 ? 100.0 * g_t_lwait / el : 0.0,
+                    /* BOTH waits, whichever path this configuration uses.
+                     *
+                     * This reported only g_t_lwait, which exists solely in the
+                     * whole-layer path, so a per-expert run showed `wait 0%` because
+                     * the counter was never touched -- and that 0 was then cited as
+                     * evidence that I/O was not the bottleneck, for a configuration
+                     * whose waiting all happens in tier_wait (g_t_io). An instrument
+                     * that reads zero because it is watching the wrong branch is worse
+                     * than none. */
+                    el > 0 ? 100.0 * (g_t_lwait + g_t_io) / el : 0.0,
                     T->nslot, T->cap,
                     T->uses ? 100.0 * (1.0 - (double)T->miss / (double)T->uses) : 0.0,
                     (double)T->bytes / 1e9);
