@@ -301,6 +301,14 @@ typedef struct {
     uint64_t clock, uses, miss;
     uint64_t bytes;
     int mapped;             /* LOAD_ALL: no buffers, no LRU, read from the map */
+    /* Unbuffered for EVERYTHING, deliberately.
+     *
+     * Letting the per-expert path stay buffered would buy the OS's readahead (360
+     * MB/s against 216 on scattered ~2 MB reads), but it costs a second copy of the
+     * same bytes in a cache we do not control -- 13 GB of physical RAM spent
+     * duplicating what our own LRU is for. On a machine where RAM is the scarce
+     * resource, that RAM belongs to the LRU, which knows the access pattern the OS has
+     * to guess. Fewer reads beats faster reads when the reads are the same bytes. */
     int direct;             /* DSV4_DIRECT=1: unbuffered reads, our LRU is the cache */
     /* TWO-LAYER DOUBLE BUFFER.
      *
@@ -1673,12 +1681,29 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
      * has to come before the chunk is sized. */
     if (batch_attn && pos0 != 0) batch_attn = 0;
 
-    /* The chunk bounds MEMORY: every buffer below is sized by it, at ~416 KB per
-     * token. Batched attention has to be one chunk, so there the prompt length is
-     * the chunk and the caller caps it; the per-token path is free to cut, and 256
-     * keeps a 5k-token prompt at ~107 MB instead of ~2 GB. */
+    /* The chunk bounds MEMORY -- every buffer below is sized by it, at ~416 KB per
+     * token -- and with whole-layer streaming it also sets the I/O per token, which
+     * is what makes 1024 the default rather than 256.
+     *
+     * A layer's whole range is read once per chunk, so the bytes per token are
+     * 43 x 3.55 GB / chunk:
+     *
+     *      chunk    GB/token    against the per-expert union (0.37 GB/token)
+     *         64      2.38           6.4x worse
+     *        256      0.60           1.6x worse
+     *        512      0.30           0.8x
+     *       1024      0.15           0.4x
+     *
+     * The crossover is around 384: past it, reading every layer whole moves FEWER
+     * bytes than fetching the 68 % the router actually asked for, and does it
+     * sequentially. The MoE batches better too, since dsv4_expert_apply_rows gets
+     * 1024 rows per expert instead of 256 to amortize the MXFP4 decode over.
+     *
+     * The price is ~426 MB of buffers at 1024 tokens, against ~107 MB at 256. On a
+     * machine with 26 GB of physical RAM actually available that is not a constraint;
+     * it was chosen when the budget was believed to be 8 GB. */
     const char *ckenv = getenv("DSV4_CHUNK");
-    int chunk = ckenv ? atoi(ckenv) : 256;
+    int chunk = ckenv ? atoi(ckenv) : 1024;
     if (chunk < 16) chunk = 16;
     if (batch_attn || n < chunk) chunk = n;
     float *h    = malloc((size_t)chunk * stride * sizeof(float));
@@ -1687,7 +1712,7 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
     float *sub  = malloc((size_t)chunk * dim * sizeof(float));
     float *post = malloc((size_t)chunk * hc * sizeof(float));
     float *comb = malloc((size_t)chunk * hc * hc * sizeof(float));
-    float *tmp  = malloc((size_t)dim * sizeof(float));
+    float *tmp  = malloc((size_t)chunk * dim * sizeof(float));  /* per token: one shared buffer would race */
     int32_t *cid = malloc((size_t)chunk * sizeof(int32_t));
 
     /* Capture buffers, sized for the widest chunk. Reused across layers and
@@ -1733,14 +1758,20 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
         else                 tier_prefetch_pred(&M->tier, 0);
 
         /* embedding -> hc copies, for the whole chunk */
+        /* Independent per token, so it is parallel. R->emb is gone from here: one
+         * shared scratch buffer across threads is a race, and the first hc copy is a
+         * perfectly good place to decode into. */
+#ifdef _OPENMP
+#       pragma omp parallel for schedule(static)
+#endif
         for (int t = 0; t < cs; t++) {
             cid[t] = (int32_t)ids[base + t];
             const DsV4W row = dsv4_w_rows(&M->embed, ids[base + t], 1);
             const uint16_t *pw = (const uint16_t *)row.w;
-            for (int d = 0; d < dim; d++) R->emb[d] = dsv4_bf16_to_f32(pw[d]);
-            for (int m = 0; m < hc; m++)
-                memcpy(h + (size_t)t * stride + (size_t)m * dim, R->emb,
-                       (size_t)dim * sizeof(float));
+            float *dst = h + (size_t)t * stride;
+            for (int d = 0; d < dim; d++) dst[d] = dsv4_bf16_to_f32(pw[d]);
+            for (int m = 1; m < hc; m++)
+                memcpy(dst + (size_t)m * dim, dst, (size_t)dim * sizeof(float));
         }
 
         for (int L = 0; L < M->n_layers; L++) {
@@ -1759,14 +1790,22 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
             else                 tier_prefetch_pred(&M->tier, L + 1);
 
             /* --- attention, batched --------------------------------------- */
+            /* Per-token and independent: mHC, the norm and the bf16 rounding touch
+             * only row t. Measured before this: 28 % of eight cores with 9 % blocked
+             * on I/O, so ~63 % of the wall clock was these loops running on one
+             * thread while the other seven idled. */
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static)
+#endif
             for (int t = 0; t < cs; t++) {
                 dsv4_hc_pre(h + (size_t)t * stride, w->hc_attn_fn, w->hc_attn_scale,
                             w->hc_attn_base, hc, dim, c->sinkhorn_iters, c->hc_eps,
                             c->norm_eps, coll + (size_t)t * dim,
                             post + (size_t)t * hc, comb + (size_t)t * hc * hc);
-                dsv4_rmsnorm(tmp, coll + (size_t)t * dim, w->attn_norm, dim, c->norm_eps);
+                dsv4_rmsnorm(tmp + (size_t)t * dim, coll + (size_t)t * dim,
+                             w->attn_norm, dim, c->norm_eps);
                 for (int d = 0; d < dim; d++)
-                    coll[(size_t)t * dim + d] = dsv4_to_bf16(tmp[d]);
+                    coll[(size_t)t * dim + d] = dsv4_to_bf16(tmp[(size_t)t * dim + d]);
             }
             { const double _t = now_s();
               if (batch_attn) {
@@ -1785,24 +1824,34 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
                                             sub + (size_t)t * dim);
               }
               g_t_attn += now_s() - _t; }
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static)
+#endif
             for (int t = 0; t < cs; t++)
                 dsv4_hc_expand(mid + (size_t)t * stride, sub + (size_t)t * dim,
                                post + (size_t)t * hc, comb + (size_t)t * hc * hc,
                                h + (size_t)t * stride, hc, dim);
 
             /* --- MoE, batched: one call, so the expert union applies ------- */
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static)
+#endif
             for (int t = 0; t < cs; t++) {
                 dsv4_hc_pre(mid + (size_t)t * stride, w->hc_ffn_fn, w->hc_ffn_scale,
                             w->hc_ffn_base, hc, dim, c->sinkhorn_iters, c->hc_eps,
                             c->norm_eps, coll + (size_t)t * dim,
                             post + (size_t)t * hc, comb + (size_t)t * hc * hc);
-                dsv4_rmsnorm(tmp, coll + (size_t)t * dim, w->ffn_norm, dim, c->norm_eps);
+                dsv4_rmsnorm(tmp + (size_t)t * dim, coll + (size_t)t * dim,
+                             w->ffn_norm, dim, c->norm_eps);
                 for (int d = 0; d < dim; d++)
-                    coll[(size_t)t * dim + d] = dsv4_to_bf16(tmp[d]);
+                    coll[(size_t)t * dim + d] = dsv4_to_bf16(tmp[(size_t)t * dim + d]);
             }
             { const double _t = now_s();
               dsv4_moe_forward(&c->moe, &w->moe, coll, cid, cs, sub);
               g_t_moe += now_s() - _t; }
+#ifdef _OPENMP
+#           pragma omp parallel for schedule(static)
+#endif
             for (int t = 0; t < cs; t++)
                 dsv4_hc_expand(h + (size_t)t * stride, sub + (size_t)t * dim,
                                post + (size_t)t * hc, comb + (size_t)t * hc * hc,
