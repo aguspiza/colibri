@@ -680,8 +680,57 @@ is 7.1 GB, and the reason two is the right depth rather than three: a third only
 helps if reads were more than twice as slow as compute, and then the disk is the
 wall and getting further ahead buys nothing.
 
-Implemented behind `DSV4_LAYER_STREAM=1`, with the per-expert path left intact for
-decode. **The 3-4x is arithmetic from two measured rates, not a measured result** --
+### Measured: it takes replacing BOTH of the OS's services
+
+Each piece lost on its own, and for reasons that cancel. The same 512 real tokens,
+four chunks, identical work:
+
+| | s/token | bytes | throughput |
+|---|---|---|---|
+| per-expert, buffered | **1.05** | 290 GB | 0.54 GB/s |
+| per-expert, direct I/O | -- | -- | 0.22 GB/s, 116 IOPS |
+| whole-layer, buffered | 1.22 | ~600 GB | 0.49 GB/s |
+| **whole-layer + direct I/O** | **1.06** | **762 GB** | **1.40 GB/s** |
+| whole-layer, 16 logical threads | 1.29 | | |
+
+The OS cache was providing TWO services: reuse caching, where our knowledge is
+strictly better (0.0 % reuse measured -- it caches 13 GB that is never re-read), and
+**readahead plus request merging**, where it was genuinely working (756 requests of
+475 KB against direct I/O's 116 of 1.9 MB). Direct I/O with scattered reads removed
+both and replaced neither, which is why it lost. Whole-layer streaming IS the
+replacement for the second: 8 pieces of 444 MB is better readahead than the OS can
+infer, because we know the whole layer will be used and it has to guess.
+
+Together they read **2.6x more bytes in the same wall time**, at 93 % of the drive's
+measured sequential ceiling, with no OS cache and the LRU never even allocated
+(`lru 0/8 slots`). Text verified identical.
+
+Equal time, not faster -- but the position dependence should differ, and that is the
+reason to prefer it on a long build. The per-expert path degraded 1.32 -> 1.52 -> 1.78
+s/token over successive 4096-token blocks; whole-layer bytes are constant by
+construction, the same 3.55 GB at token 500 as at token 19000.
+
+**16 logical threads lost here too** (1.29 against 1.22), even at 88 % CPU where the
+decode-era explanation -- readers fighting compute for cores -- no longer applies.
+The MXFP4 decode is ALU- and cache-bound rather than latency-bound, so SMT only
+halves L1/L2 per thread.
+
+### And the utilization numbers that led here were not measurements
+
+The 37 % -> 88 % CPU that justified calling the engine compute-bound was two
+instantaneous 30-second samples from two different runs, placed next to a wall-clock
+average. With the same compute and 3x the utilization the wall time should have
+fallen 3x; it rose. The kernel-copy explanation offered for that does not survive
+arithmetic either: 600 GB copied over 627 s is ~60 s of memcpy, 1-2 % of eight cores,
+not 58 points.
+
+So the engine now reports, per chunk, run-averaged CPU split into user and kernel,
+and the seconds spent BLOCKED in `layer_wait`. That last one matters because the hit
+counter cannot see it: in streaming mode `tier_get` issues no read, records a hit, and
+then blocks for as long as the disk takes -- a 99.8 % hit rate is compatible with
+waiting on I/O the whole time.
+
+The original 3-4x projection was arithmetic from two measured rates, not a result --
 43 layers x 3.55 GB per 256-token chunk at 1514 MB/s would be 0.39 s/token against
 the 1.32-1.78 observed. Whether the drive holds that rate across 152 GB per chunk,
 and whether compute then becomes the wall, is the next thing to measure and not

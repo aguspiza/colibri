@@ -344,6 +344,10 @@ typedef struct {
     int lbuf_layer[2];      /* which layer each buffer holds, -1 = nothing */
     int lbuf_pend[2];       /* pieces still in flight */
     int64_t *lay_off, *lay_len;   /* [layer] the contiguous range */
+    int64_t *lay_base;            /* [layer] lay_off rounded DOWN to 4K, for direct I/O:
+                                   * the piece boundaries and the buffer must be
+                                   * aligned, so the buffer holds [base, off+len) and
+                                   * an expert sits at off - base. */
     int *lay_shard;
     int64_t lspan;          /* the widest layer, i.e. the buffer size */
     int lpieces;            /* how many parallel pieces per layer */
@@ -422,6 +426,7 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
     T->lay_off   = (int64_t *)malloc((size_t)n_layers * sizeof(int64_t));
     T->lay_len   = (int64_t *)malloc((size_t)n_layers * sizeof(int64_t));
     T->lay_shard = (int *)malloc((size_t)n_layers * sizeof(int));
+    T->lay_base  = (int64_t *)malloc((size_t)n_layers * sizeof(int64_t));
     T->lspan = 0;
     for (int L = 0; L < n_layers; L++) {
         int64_t lo = INT64_MAX, hi = 0;
@@ -435,7 +440,8 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
             }
         T->lay_shard[L] = sh;
         T->lay_off[L] = lo;
-        T->lay_len[L] = multi ? 0 : hi - lo;   /* 0 disables the fast path for it */
+        T->lay_base[L] = dio_down(lo);
+        T->lay_len[L] = multi ? 0 : hi - T->lay_base[L];   /* 0 disables the fast path */
         if (T->lay_len[L] > T->lspan) T->lspan = T->lay_len[L];
     }
 
@@ -445,7 +451,10 @@ static void tier_init(ExpertTier *T, shards *S, int n_layers, int n_experts,
         T->lpieces = T->nthreads > 0 ? T->nthreads : 8;
         if (T->lstream) {
             for (int b = 0; b < T->lbuf_n; b++) {
-                T->lbuf[b] = (uint8_t *)malloc((size_t)T->lspan);
+                void *m = NULL;
+                if (posix_memalign(&m, DIO_ALIGN,
+                                   (size_t)dio_up(T->lspan) + DIO_ALIGN) != 0) m = NULL;
+                T->lbuf[b] = (uint8_t *)m;
                 T->lbuf_layer[b] = -1;
                 if (!T->lbuf[b]) {
                     fprintf(stderr, "[lstream] cannot allocate 2 x %.2f GB; falling "
@@ -513,14 +522,24 @@ static void layer_start(ExpertTier *T, int layer)
     pthread_mutex_unlock(&T->mu);
 }
 
+/* Seconds spent BLOCKED waiting for a layer's pieces.
+ *
+ * The hit counter cannot see this: in streaming mode tier_get issues no read, so
+ * it records a hit and then blocks in here for as long as the disk takes. A 99.8 %
+ * hit rate is therefore compatible with waiting on I/O the entire time, which is
+ * exactly the wrong thing for an instrument to hide. */
+static double g_t_lwait = 0.0;
+
 /* The buffer holding `layer`, once its reads are done; -1 if it is not queued. */
 static int layer_wait(ExpertTier *T, int layer)
 {
     for (int b = 0; b < T->lbuf_n; b++)
         if (T->lbuf_layer[b] == layer) {
+            const double t0 = now_s();
             pthread_mutex_lock(&T->mu);
             while (T->lbuf_pend[b]) pthread_cond_wait(&T->cv_done, &T->mu);
             pthread_mutex_unlock(&T->mu);
+            g_t_lwait += now_s() - t0;
             return b;
         }
     return -1;
@@ -635,23 +654,26 @@ static void tier_read_one(ExpertTier *T, int slot, int layer, int e, int k, int 
 static void tier_read_piece(ExpertTier *T, int buf, int layer, int piece, int tid)
 {
     const int64_t len = T->lay_len[layer];
-    const int64_t per = (len + T->lpieces - 1) / T->lpieces;
+    /* 4K-aligned piece boundaries: required for direct I/O and harmless otherwise. */
+    const int64_t per = dio_up((len + T->lpieces - 1) / T->lpieces);
     const int64_t a = per * piece;
     if (a >= len) return;
-    const int64_t nb = (len - a < per) ? len - a : per;
+    int64_t nb = (len - a < per) ? len - a : per;
+    if (T->direct) nb = dio_up(nb);            /* the tail may read past the range */
     const int fd = T->fd[(size_t)tid * T->nshard + T->lay_shard[layer]];
     uint8_t *out = T->lbuf[buf] + a;
+    const int64_t need = (len - a < per) ? len - a : per;
     int64_t done = 0;
-    while (done < nb) {
+    while (done < need) {
         const ssize_t got = pread(fd, out + done, (size_t)(nb - done),
-                                  T->lay_off[layer] + a + done);
+                                  T->lay_base[layer] + a + done);
         if (got <= 0) {
             fprintf(stderr, "short read on layer %d piece %d\n", layer, piece);
             exit(1);
         }
         done += got;
     }
-    T->bytes += (uint64_t)nb;
+    T->bytes += (uint64_t)need;
 }
 
 /* A worker: pulls jobs off the queue until told to stop. Its index is also the
@@ -865,7 +887,7 @@ static void tier_get(ExpertTier *T, int layer, int e, DsV4W *w1, DsV4W *w2, DsV4
             const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + e) * 6];
             uint8_t *q[6];
             for (int k = 0; k < 6; k++)
-                q[k] = T->lbuf[b] + (d[k].off - T->lay_off[layer]);
+                q[k] = T->lbuf[b] + (d[k].off - T->lay_base[layer]);
             *w1 = dsv4_w_mxfp4(q[0], q[1], T->inter, T->dim);
             *w2 = dsv4_w_mxfp4(q[2], q[3], T->dim,   T->inter);
             *w3 = dsv4_w_mxfp4(q[4], q[5], T->inter, T->dim);
@@ -1613,6 +1635,31 @@ static const float *run_step(Run *R, int tokid) {
  * sets them, so serve mode stays quiet. */
 static int g_progress = 0, g_prog_total = 0, g_prog_from = 0;
 static double g_prog_t0 = 0.0;
+static double g_cpu_u0 = 0.0, g_cpu_k0 = 0.0;
+
+/* Process CPU, user and kernel, ACCUMULATED since the process started.
+ *
+ * Sampling utilization over a 30-second window and comparing it against another
+ * window from another run is not a measurement: it put an instantaneous 88 % next to
+ * an instantaneous 37 % and a wall-clock average, and concluded the engine had become
+ * compute-bound. Averages have to be compared with averages.
+ *
+ * The split is the diagnostic. If the extra CPU is KERNEL it is I/O overhead; if it
+ * is USER the compute itself grew, which would be a bug and not a trade. */
+static void cpu_times(double *user, double *krnl)
+{
+    *user = *krnl = 0.0;
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) {
+        ULARGE_INTEGER ku, uu;
+        ku.LowPart = k.dwLowDateTime; ku.HighPart = k.dwHighDateTime;
+        uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+        *krnl = (double)ku.QuadPart / 1e7;
+        *user = (double)uu.QuadPart / 1e7;
+    }
+#endif
+}
 
 static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
                                 int batch_attn)
@@ -1786,12 +1833,20 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
              * two settings -- which is exactly the kind of thing that has to be
              * read off the cache, not inferred from the process's memory. */
             const ExpertTier *T = &R->M->tier;
+            double cu, ck; cpu_times(&cu, &ck);
+            const double ncore = (double)(omp_get_max_threads() > 0
+                                          ? omp_get_max_threads() : 8);
             fprintf(stderr, "[prog] %d/%d  %.1f%%  %.2f s/token  %.0f min elapsed  "
-                            "eta %.1f h  | lru %d/%d slots  %.1f%% hit  %.0f GB read\n",
+                            "eta %.1f h  | cpu %.0f%% (usr %.0f sys %.0f)"
+                            "  | wait %.0f%%  | lru %d/%d slots  %.1f%% hit  %.0f GB read\n",
                     done, g_prog_total,
                     g_prog_total ? 100.0 * done / g_prog_total : 0.0,
                     per, el / 60.0,
                     (g_prog_total > done) ? (g_prog_total - done) * per / 3600.0 : 0.0,
+                    el > 0 ? 100.0 * ((cu - g_cpu_u0) + (ck - g_cpu_k0)) / (el * ncore) : 0.0,
+                    el > 0 ? 100.0 * (cu - g_cpu_u0) / (el * ncore) : 0.0,
+                    el > 0 ? 100.0 * (ck - g_cpu_k0) / (el * ncore) : 0.0,
+                    el > 0 ? 100.0 * g_t_lwait / el : 0.0,
                     T->nslot, T->cap,
                     T->uses ? 100.0 * (1.0 - (double)T->miss / (double)T->uses) : 0.0,
                     (double)T->bytes / 1e9);
@@ -2270,6 +2325,7 @@ int main(int argc, char **argv) {
                         "every %d\n", plen, np, nbuild, every);
         const double t0 = now_s();
         g_progress = 1; g_prog_total = nbuild; g_prog_from = done0; g_prog_t0 = t0;
+        cpu_times(&g_cpu_u0, &g_cpu_k0);   /* so model load is out of the average */
         for (int done = done0; done < nbuild; ) {
             const int take = (nbuild - done < every) ? nbuild - done : every;
             run_prefill(&R, ids + done, take, done, 0);
