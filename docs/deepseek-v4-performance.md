@@ -536,6 +536,67 @@ token range.
 
 All three modes generate **the same text**.
 
+## Memory: the engine was not managing it, the OS was
+
+The port streams 137 GB through 31.4 GB of RAM on purpose. If the OS is paging, the
+premise is refuted -- it is doing a worse version of the same job, behind our back,
+against the same disk we are already saturating. It was.
+
+A six-hour cache build filled the disk and ended with reads failing with `EIO`. The
+accounting, all measured:
+
+| | |
+|---|---|
+| engine private memory (`read` mode) | 14.0 GB (8.67 dense + ~5 of LRU) |
+| **system file cache, filled by our own preads** | **12.5 GB** |
+| other 281 processes | 3.8 GB |
+| kernel pools | 1.6 GB |
+| total against 31.4 GB of RAM | **31.9 GB** |
+
+Over the limit, and the eviction rule decides the rest: clean file pages are dropped
+for free, anonymous pages must be **written** first. So Windows pushed the engine's
+14 GB to the page file, which grew ~20 GB, filled the disk, and then large reads
+started failing. **The engine's own streaming evicted the engine.** What got written
+to the page file was ~14 GB of duplicates of bytes already sitting in the
+`.safetensors` next to them.
+
+The commit counter alone did not predict it -- 37.1 GB against 31.4 GB of RAM
+implied ~6 GB of paging, and the page file grew 20. The missing term was the system
+cache, which is in neither our working set nor our commit.
+
+Four separate mechanisms, one per link in the chain:
+
+| link | fix | knob |
+|---|---|---|
+| our reads fill the OS cache | **direct I/O**, unbuffered | `DSV4_DIRECT=1` |
+| dense weights are anonymous, so eviction means swap | map them | `DSV4_LOAD=dense` |
+| the LRU has no budget | size it from RAM (still a fixed 384 by default) | `argv[1]` |
+| residency is the OS's call | hard working-set cap | `DSV4_WS_MAX_GB` |
+
+None of them is sufficient alone, and two of them are traps on their own:
+
+- **`read`** keeps the fastest expert path but holds 14 GB of anonymous memory, which
+  is the thing that swaps.
+- **`all`** takes private memory to 0.6 GB, and then the working set grows until only
+  0.5 GB of the machine is available. Worse, it removes the reader pool: experts
+  arrive as synchronous page faults, at queue depth ~1. Measured, same prompt,
+  minutes apart: **141 MB/s and 28 % CPU with `all`, against 360 MB/s and 54 % with
+  `dense`** -- 686 fault-driven I/Os per second of 211 KB each, versus explicit
+  parallel preads. `PrefetchVirtualMemory` is advisory; when compute catches up with
+  it, the fault is synchronous and nothing is pipelined.
+
+The working-set cap is the cheapest of the four. It does not discard anything: the
+excess moves to the **standby list**, still in RAM serving re-reads, but counted as
+available.
+
+| | working set | available |
+|---|---|---|
+| no cap | 22.86 GB | 0.55 GB |
+| capped at 8 GB | 8.00 GB | 16.80 GB |
+
+with the throughput difference inside the noise (254 MB/s against 325 and 230).
+Clean file pages cost nothing to move.
+
 ## What is left
 
 - **I/O is 39 %** of the time (6.6 s of 16.8). The floor is the distinct experts
