@@ -143,6 +143,63 @@ static uint8_t *map_file(const char *path, uint64_t *len) {
 }
 #endif
 
+/* ---------------------------------------------------------------------------
+ * A HARD CAP on the working set, because otherwise the OS decides.
+ *
+ * Mapped pages accumulate in the process working set and Windows keeps them there
+ * until something pushes back. Measured during a 19701-token build: the working set
+ * reached 22.86 GB with 0.55 GB of the machine's 31.4 GB left available, and the
+ * page file had grown ~20 GB over the night, filling the disk until reads began
+ * failing with EIO.
+ *
+ * Capping it does not throw the data away -- it moves the excess to the STANDBY
+ * list, where it is still in RAM serving re-reads without touching disk, but counts
+ * as available for everything else. Measured, same run, seconds apart:
+ *
+ *     no cap : working set 22.86 GB, available  0.55 GB
+ *     8 GB   : working set  8.00 GB, available 16.80 GB, standby 16.8 GB
+ *
+ * and the throughput difference was noise (254 MB/s against 325 and 230). Clean
+ * file pages cost nothing to move, so the cap is close to free.
+ *
+ * This is the difference between the OS managing our memory and us managing it. An
+ * engine whose whole purpose is to stream 137 GB through 31 GB of RAM cannot leave
+ * the residency decision to a heuristic that does not know the access pattern.
+ * ------------------------------------------------------------------------- */
+#ifdef _WIN32
+#ifndef QUOTA_LIMITS_HARDWS_MAX_ENABLE
+#define QUOTA_LIMITS_HARDWS_MAX_ENABLE 0x00000004
+#endif
+static void ws_cap(void)
+{
+    const char *e = getenv("DSV4_WS_MAX_GB");
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    const double ram = (double)ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+    /* A quarter of physical RAM by default: it leaves the file cache and the rest of
+     * the machine the other three quarters, and on the box this was measured on it
+     * lands at 7.9 GB -- the value that was actually validated. `0` disables it. */
+    double gb = e ? atof(e) : ram / 4.0;
+    if (gb <= 0.0) { if (e) fprintf(stderr, "[ws] cap disabled\n"); return; }
+    if (!e) { if (gb < 2.0) gb = 2.0; if (gb > 16.0) gb = 16.0; }
+
+    SIZE_T mx = (SIZE_T)(gb * 1024.0 * 1024.0 * 1024.0);
+    SIZE_T mn = (SIZE_T)256 << 20;
+    if (mn > mx / 2) mn = mx / 2;
+    if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), mn, mx,
+                                    QUOTA_LIMITS_HARDWS_MAX_ENABLE))
+        fprintf(stderr, "[ws] could not cap the working set (error %lu); the OS keeps "
+                        "the residency decision\n", (unsigned long)GetLastError());
+    else
+        fprintf(stderr, "[ws] working set capped at %.1f GB of %.1f GB of RAM\n",
+                gb, ram);
+}
+#else
+/* Linux has no equivalent hard cap; madvise/cgroups are the levers there. */
+static void ws_cap(void) {}
+#endif
+
 /* The mapped shards. Pointing the kernel at arbitrary offsets is safe:
  * quant.h does not use a single aligned load, only `loadu` (49 of 49). */
 static uint8_t **g_smap;
@@ -292,8 +349,10 @@ static int tier_reserve(ExpertTier *T)
     if (T->nslot < T->cap) v = T->nslot++;
     else {
         /* A slot with reads IN FLIGHT cannot be evicted: the workers are writing
-         * into its buffers. At most `topk` are in flight and the cache holds
-         * hundreds, so skipping them never leaves the LRU without a candidate. */
+         * into its buffers. What keeps the LRU from running out of candidates is
+         * pf_window() capping the in-flight set at cap/4 -- it used to be that "at
+         * most topk are in flight", which stopped being true when prefill started
+         * prefetching a whole union. */
         v = -1;
         for (int i = 0; i < T->nslot; i++) {
             if (T->slots[i].pending) continue;
@@ -407,17 +466,42 @@ static void tier_wait(ExpertTier *T, int slot)
  * bandwidth with several reads in flight, and one at a time it is latency-bound.
  * Slot reservation stays serial — the LRU is global state — and only the reads
  * are spread out. */
+/* How many experts may be in flight at once.
+ *
+ * This was a hard 16, which was right for decode -- topk is 6, so a layer's union
+ * IS about 6 experts and 16 never truncated. Batched prefill broke that silently:
+ * with 256 rows the union is ~250 experts, so 16 were prefetched in parallel and
+ * the other ~234 were read one at a time, blocking, inside the union loop.
+ * Measured while building a 19701-token cache: 193 MB/s from a drive that gives
+ * 1514 MB/s to a single sequential reader, with the CPU at 34 %. Not the disk's
+ * limit -- ours, for lack of queue depth.
+ *
+ * The bound is the CACHE, not a constant: tier_reserve cannot evict a slot with
+ * reads in flight, so a window near `cap` would leave the LRU with no candidate
+ * and abort. A quarter of the cache keeps that invariant with room to spare. */
+#define DSV4_PF_MAX 256
+static int pf_window(const ExpertTier *T) {
+    const char *e = getenv("DSV4_PF_WINDOW");
+    int w = e ? atoi(e) : 64;
+    if (w < 1) w = 1;
+    if (w > DSV4_PF_MAX) w = DSV4_PF_MAX;
+    if (T->cap / 4 > 0 && w > T->cap / 4) w = T->cap / 4;
+    if (w < 1) w = 1;
+    return w;
+}
+
 static void tier_prefetch(ExpertTier *T, int layer, const int *es, int n)
 {
-    int slot[16], want[16], nw = 0;
-    if (n > 16) n = 16;
+    int slot[DSV4_PF_MAX], want[DSV4_PF_MAX], nw = 0;
+    const int win = pf_window(T);
+    if (n > win) n = win;
     if (T->mapped) {
         /* The OS is ASKED to bring the ranges in, without touching them:
          * touching them would cost the same bandwidth as reading them. It is a
          * hint, not a guarantee; if a page has not arrived, the fault resolves at
          * read time. */
 #ifdef _WIN32
-        WIN32_MEMORY_RANGE_ENTRY r[16 * 6];
+        WIN32_MEMORY_RANGE_ENTRY r[DSV4_PF_MAX * 6];
         int nr = 0;
         for (int k = 0; k < n; k++) {
             const ExpTensor *d = &T->tens[((size_t)layer * T->n_experts + es[k]) * 6];
@@ -1219,6 +1303,12 @@ static const float *run_step(Run *R, int tokid) {
  * Returns the logits for the LAST position, which is the only one generation
  * needs.
  * ------------------------------------------------------------------------- */
+/* Progress for a long offline build: the total, where THIS run started (so a resumed
+ * checkpoint does not flatter the rate), and when it began. Zero unless the builder
+ * sets them, so serve mode stays quiet. */
+static int g_progress = 0, g_prog_total = 0, g_prog_from = 0;
+static double g_prog_t0 = 0.0;
+
 static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
                                 int batch_attn)
 {
@@ -1356,6 +1446,25 @@ static const float *run_prefill(Run *R, const int *ids, int n, int pos0,
             if (R->hist && R->nhist < R->hcap) R->hist[R->nhist++] = ids[base + t];
         R->pos = pos0 + base + cs;
         lastrow = cs - 1;
+
+        /* Per-CHUNK progress, not per checkpoint.
+         *
+         * A 19700-token build checkpoints every 4096 tokens: four lines in seven
+         * hours, which leaves "how far along is it" to be guessed from I/O counters
+         * and a carried-over bytes-per-token constant. The chunk loop is the only
+         * place that knows the exact position, so it is the only place that can
+         * answer it. */
+        if (g_progress) {
+            const int done = pos0 + base + cs;
+            const double el = now_s() - g_prog_t0;
+            const double per = (done > g_prog_from) ? el / (done - g_prog_from) : 0.0;
+            fprintf(stderr, "[prog] %d/%d  %.1f%%  %.2f s/token  %.0f min elapsed  "
+                            "eta %.1f h\n",
+                    done, g_prog_total,
+                    g_prog_total ? 100.0 * done / g_prog_total : 0.0,
+                    per, el / 60.0,
+                    (g_prog_total > done) ? (g_prog_total - done) * per / 3600.0 : 0.0);
+        }
     }
 
     /* Logits for the last position only.
@@ -1739,6 +1848,7 @@ int main(int argc, char **argv) {
      * cores from the I/O doing the real work. This engine is in that regime (I/O
      * is 40 % of the time). */
     coli_omp_tune_threads("deepseek_v4");
+    ws_cap();                      /* before anything is mapped or read */
 
     /* The gateway launches the engine with SNAP=<dir>, SERVE=1 and
      * NGEN=<max_tokens>, and passes the cache `cap` as argv[1]. */
@@ -1801,6 +1911,14 @@ int main(int argc, char **argv) {
         if (np < 2) { fprintf(stderr, "prompt too short to cache\n"); return 1; }
         const int nbuild = np - 1;
 
+        /* RESUME. Hours of prefill are exactly the thing that must not have to be
+         * repeated because the build was interrupted -- or because the engine was
+         * rebuilt to make it faster. snap_load_best already picks the deepest
+         * checkpoint whose history is a prefix, which is precisely this. */
+        int done0 = snap_load_best(&R, out, ids, np);
+        if (done0 > 0)
+            fprintf(stderr, "[build] resuming from checkpoint at %d tokens\n", done0);
+
         /* Prefill in slices, saving a checkpoint after each. run_prefill already
          * takes an absolute start position and maintains the state itself, so a
          * slice is the same work as the equivalent stretch of one long call --
@@ -1811,7 +1929,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[build] %ld bytes -> %d tokens; prefilling %d, checkpoint "
                         "every %d\n", plen, np, nbuild, every);
         const double t0 = now_s();
-        for (int done = 0; done < nbuild; ) {
+        g_progress = 1; g_prog_total = nbuild; g_prog_from = done0; g_prog_t0 = t0;
+        for (int done = done0; done < nbuild; ) {
             const int take = (nbuild - done < every) ? nbuild - done : every;
             run_prefill(&R, ids + done, take, done, 0);
             done += take;
@@ -1822,8 +1941,9 @@ int main(int argc, char **argv) {
                     R.nhist, nbuild, now_s() - t0);
         }
         const double dt = now_s() - t0;
+        const int did = nbuild - done0;
         fprintf(stderr, "[build] done: %d tokens in %.1f s (%.3f s/token)\n",
-                nbuild, dt, dt / nbuild);
+                did > 0 ? did : nbuild, dt, dt / (did > 0 ? did : nbuild));
         return 0;
     }
 
