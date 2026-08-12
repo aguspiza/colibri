@@ -732,6 +732,37 @@ int main(int argc, char **argv) {
                 }
                 printf("  (the last column is what batched attention would buy if it\n"
                        "   accepted a non-zero start position)\n");
+
+                /* THE OPTIMAL CASE: everything already in physical RAM.
+                 *
+                 * Every other number in this project mixes compute with getting the
+                 * bytes there. This one does not -- the expert read at the top of main
+                 * is still resident -- so it is the pure MXFP4 ceiling at the shape the
+                 * MoE uses. Whatever the engine achieves below this is serialization or
+                 * I/O, and the gap IS the size of the defect. Without this line there
+                 * is no way to tell "as fast as the machine allows" from "a third of
+                 * it", which is how a morning went into optimizing a 4 % I/O wait. */
+                printf("\n--- optimal case: expert resident in RAM, pure compute ---\n");
+                {
+                    const int rows[] = { 1, 256, 1024 };
+                    for (unsigned ri = 0; ri < sizeof rows / sizeof *rows; ri++) {
+                        const int R = rows[ri];
+                        float *xin = malloc((size_t)R * I * sizeof(float));
+                        float *yo  = malloc((size_t)R * O * sizeof(float));
+                        for (int64_t i = 0; i < (int64_t)R * I; i++)
+                            xin[i] = 0.01f * (float)((i % 97) - 48);
+                        matmul_mxfp4(yo, xin, q4, e8, R, I, O);   /* fault it in */
+                        const double t = now_s();
+                        matmul_mxfp4(yo, xin, q4, e8, R, I, O);
+                        const double dt = now_s() - t;
+                        printf("  rows %4d  %8.1f ms  %6.1f GFLOP/s  %6.3f ms/row\n",
+                               R, dt * 1e3,
+                               2.0 * (double)R * I * O / dt / 1e9, dt * 1e3 / R);
+                        free(xin); free(yo);
+                    }
+                    printf("  (3 matrices per expert, 6 experts per token: the model's\n"
+                           "   compute floor per token follows from the best row)\n");
+                }
             }
 
             /* --- SEEDED STATE: does prefill leave what decode would? ----
