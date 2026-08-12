@@ -54,27 +54,31 @@ static inline void dsv4_matmul(float *y, const float *x, const float *w,
  *   out : [b, s, min(s, win)]
  */
 static inline int dsv4_window_topk_prefill_at(int *out, int b, int s, int win,
-                                             int pos0) {
+                                             int pos0, int pre) {
     const int ntopk = (s < win) ? s : win;
     for (int bi = 0; bi < b; bi++)
         for (int i = 0; i < s; i++) {
             int *row = out + ((size_t)bi * s + i) * ntopk;
-            /* With pos0 > 0 the window reaches before the batch. Those entries are
-             * marked -1 here, which is CORRECT ONLY once the caller has nothing there
-             * to attend -- i.e. it is still the position-0 case. Prepending the prior
-             * window is the piece that makes pos0 > 0 usable. */
-            const int start = (i - win + 1 > 0) ? i - win + 1 : 0;
+            /* Absolute positions, mapped into a KV whose first `pre` entries are the
+             * tokens BEFORE this batch: absolute a sits at pre + (a - pos0), which is
+             * in [0, pre) for the tail of the previous chunk and >= pre inside it. */
+            const int here = pos0 + i;
+            int start = here - win + 1;
+            if (start < pos0 - pre) start = pos0 - pre;
+            if (start < 0) start = 0;
             for (int j = 0; j < ntopk; j++) {
-                const int t = start + j;
-                row[j] = (t > i) ? -1 : t;
+                const int a = start + j;
+                row[j] = (a > here) ? -1 : pre + (a - pos0);
             }
         }
     return ntopk;
 }
 
 static inline int dsv4_window_topk_prefill(int *out, int b, int s, int win) {
-    return dsv4_window_topk_prefill_at(out, b, s, win, 0);
+    return dsv4_window_topk_prefill_at(out, b, s, win, 0, 0);
 }
+
+
 
 typedef struct {
     int dim, q_lora, heads, hd, rd, groups, o_lora, win;
@@ -141,12 +145,45 @@ typedef struct {
  * before the batch, and the blocks compressed earlier are not in this KV at all. Those
  * need the prior state passed in, and until they are, pos0 > 0 is rejected rather than
  * silently wrong -- see the `todo` line in check_real. */
+/* Whether a batch can resume from a prior state on this layer.
+ *
+ * The blocker for ratio == 4 is the Indexer: it SCORES the compressed blocks to pick
+ * which to attend, and extending that scoring over the blocks compressed before the
+ * batch needs its own prior KV threaded through the scoring path. The high-ratio
+ * layers attend all causally available blocks in order, so prepending them is enough.
+ *
+ * The engine can therefore resume the 22 non-indexer layers and decode the other 21,
+ * which is a partial win rather than none. */
+static inline int dsv4_prefill_can_resume(const DsV4AttnCfg *c) {
+    return c->ratio != 4;
+}
+
 static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
                                              const DsV4AttnW *w,
                                              const float *x, const int *topk,
                                              int b, int s, int ntopk, int pos0,
+                                             const float *prev_kv, int prev_win,
+                                             int prev_ncomp,
                                              float *out, DsV4Capture *cap)
 {
+    /* `prev_kv` is the state's KV as of pos0 -- the [win + ncomp, hd] array, ring
+     * first -- or NULL for a batch that starts the sequence. Raw pointers rather than
+     * DsV4AttnState because that type lives in dsv4_decode.h, which includes this
+     * header rather than the other way round.
+     *
+     * pos0 must be a multiple of ratio when prev is given: that is what makes the
+     * compressor's in-progress block empty at the boundary, so there is nothing
+     * partial to continue. Chunks are 256 or 1024 and ratio is 4 or 128, so it holds
+     * by construction; the assert is there because if it ever stops holding the error
+     * would be a subtly wrong block rather than a crash. */
+    const int pre = (prev_kv && pos0 > 0)
+                  ? ((c->win - 1 < pos0) ? c->win - 1 : pos0) : 0;
+    const int pblk = (prev_kv && pos0 > 0 && c->ratio) ? pos0 / c->ratio : 0;
+    if (prev_kv && pos0 > 0 && c->ratio && (pos0 % c->ratio)) {
+        fprintf(stderr, "prefill_cap: pos0 %d is not a multiple of ratio %d\n",
+                pos0, c->ratio);
+        exit(1);
+    }
     const int64_t bs = (int64_t)b * s;
     const int qdim = c->heads * c->hd;
 
@@ -259,12 +296,13 @@ static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
          * what the engine has to do: in those layers there is nothing to score. */
         int keep;
         if (c->ratio != 4) {
-            keep = ngrp;
+            keep = pblk + ngrp;
             ctopk = malloc((size_t)bs * keep * sizeof(int));
             for (int64_t r = 0; r < bs; r++) {
+                /* Absolute block count, indexed past [prior window | batch]. */
                 const int limit = (pos0 + (int)(r % s) + 1) / c->ratio;
                 for (int k = 0; k < keep; k++)
-                    ctopk[r * keep + k] = (k >= limit) ? -1 : k + s;
+                    ctopk[r * keep + k] = (k >= limit) ? -1 : pre + s + k;
             }
         } else {
             /* The Indexer's Compressor: its own smaller KV, Hadamard+FP4 */
@@ -317,13 +355,29 @@ static inline void dsv4_attention_prefill_cap(const DsV4AttnCfg *c,
         }
 
         /* concatenar: KV = [ventana | comprimido], topk = [ventana | indexer] */
-        n_kv = s + ngrp;
+        /* [prior window | batch window | prior blocks | batch blocks] */
+        n_kv = pre + s + pblk + ngrp;
         kv_cat = malloc((size_t)b * n_kv * c->hd * sizeof(float));
         for (int bi = 0; bi < b; bi++) {
-            memcpy(kv_cat + (size_t)bi * n_kv * c->hd,
+            float *dst = kv_cat + (size_t)bi * n_kv * c->hd;
+            /* The prior window comes out of the ring: absolute t lives at t % win. */
+            for (int j = 0; j < pre; j++) {
+                const int t = pos0 - pre + j;
+                memcpy(dst + (size_t)j * c->hd,
+                       prev_kv + ((size_t)bi * (prev_win + prev_ncomp)
+                                  + (t % prev_win)) * c->hd,
+                       (size_t)c->hd * sizeof(float));
+            }
+            memcpy(dst + (size_t)pre * c->hd,
                    kv + (size_t)bi * s * c->hd,
                    (size_t)s * c->hd * sizeof(float));
-            memcpy(kv_cat + ((size_t)bi * n_kv + s) * c->hd,
+            /* The blocks compressed before this batch sit after the ring. */
+            for (int j = 0; j < pblk; j++)
+                memcpy(dst + (size_t)(pre + s + j) * c->hd,
+                       prev_kv + ((size_t)bi * (prev_win + prev_ncomp)
+                                  + prev_win + j) * c->hd,
+                       (size_t)c->hd * sizeof(float));
+            memcpy(dst + (size_t)(pre + s + pblk) * c->hd,
                    kv_comp + (size_t)bi * ngrp * c->hd,
                    (size_t)ngrp * c->hd * sizeof(float));
         }
@@ -383,7 +437,7 @@ static inline void dsv4_attention_prefill(const DsV4AttnCfg *c,
                                           const float *x, const int *topk,
                                           int b, int s, int ntopk, float *out)
 {
-    dsv4_attention_prefill_cap(c, w, x, topk, b, s, ntopk, 0, out, NULL);
+    dsv4_attention_prefill_cap(c, w, x, topk, b, s, ntopk, 0, NULL, 0, 0, out, NULL);
 }
 
 #endif /* DSV4_ATTN_H */
